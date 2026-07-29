@@ -26,7 +26,7 @@ A practical collection of English-language notes for understanding, building, te
 
 ### Data types, expressions, and functions
 
-- [Data type storage models](DataType/data_type_store_model.md)
+- [Dynamic and JSON storage models](DataType/data_type_store_model.md)
 - [Map column design and storage](DataType/column_Map.md)
 - [Expression trees and actions](expressions.md)
 - [Function return types](functions.md)
