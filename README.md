@@ -35,6 +35,7 @@ A practical collection of English-language notes for understanding, building, te
 ### Query execution and indexes
 
 - [Distributed query send/receive path](distributed_query/send_recieve.md)
+- [Hash join internals](Join/hash_join.md)
 - [Text skip index internals](SkipIndex/text_index.md)
 - [`apply_mutations_on_fly` internals](Mutations/apply_mutations_on_fly.md)
 
