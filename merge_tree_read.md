@@ -1,13 +1,13 @@
 ## ReadTask
-`MergeTreeReadTask`用来表示一个read任务
+`MergeTreeReadTask` represents a read task.
 
 ### estimateNumRows
-先基于字节配额和单列大小估计行数，再保证不低于索引粒度粒度，最后结合当前未读行数和索引粒度做精确调整。
+It first estimates the row count from the byte quota and per-column size, ensures that the estimate is no smaller than the index granularity, and then adjusts it using the number of unread rows and the index granularity.
 
-这样能保证读取的行数既满足字节和列大小限制，也不会读取过少数据，保持效率。
+This ensures that the read respects byte and column-size limits without reading too little data to remain efficient.
 
-如果没有预测器则退化为简单的最大块行数限制。
-之后取`max_block_size_rows`和`recommended_rows`的最小值，`max_block_size_rows`默认值为`65409`
+If no predictor is available, it falls back to the maximum block-row limit.
+It then takes the smaller of `max_block_size_rows` and `recommended_rows`. The default value of `max_block_size_rows` is `65409`.
 ```
   UInt64 recommended_rows = estimateNumRows();
   UInt64 rows_to_read = std::max(static_cast<UInt64>(1), std::min(block_size_params.max_block_size_rows, recommended_rows));
@@ -15,10 +15,10 @@
 
 ## MergeTreeReadPool
 
-`fillPerThreadInfo`填充每一个线程的读取任务，将经过分区，minmax裁剪之后的所有part的总mark均匀的分配到每个线程。
+`fillPerThreadInfo` creates the read task for each thread, distributing the total marks from all parts that remain after partition and min-max pruning evenly across the threads.
 
 ## MergeTreeInOrderSelectAlgorithm
-顺序读取mark
+Reads marks in forward order.
 
 ## MergeTreeInReverseOrderSelectAlgorithm
-逆序读取mark
+Reads marks in reverse order.

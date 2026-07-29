@@ -11,49 +11,49 @@
 
 
 ## Dynamic
-Dynamic 新增的 “半结构化数据列类型”，
-用于存储 动态类型数据，即一个列中可以同时存在多种底层类型的值，例如：
+Dynamic is a new semi-structured data column type.
+It stores dynamically typed data, allowing values with different underlying types to coexist in a single column. For example:
 ```
 SELECT CAST(1 AS Dynamic), CAST('abc' AS Dynamic), CAST([1,2] AS Dynamic);
 ```
-一、整体存储模型概览
+### 1. Storage Model Overview
 
-与传统的 Variant 不同：
+Unlike the traditional `Variant` type:
 
-- Variant 是静态定义的多态类型（类型集合固定）；
+- `Variant` is a statically defined polymorphic type with a fixed set of types.
 
-- Dynamic 是可增生的多态类型（运行时自动扩展类型集合）；
+- `Dynamic` is an extensible polymorphic type whose set of types grows automatically at runtime.
 
-二者底层都依赖 ColumnVariant，但 Dynamic 在其上包了一层自描述的动态管理层。
+Both rely on `ColumnVariant` internally, but `Dynamic` adds a self-describing dynamic management layer on top.
 
-从源码可以看到，ColumnDynamic 的存储结构其实是 一个 “ColumnVariant + 元信息层”。
+The source code shows that the `ColumnDynamic` storage structure is effectively a `ColumnVariant` plus a metadata layer.
 ```
 // simplified view:
 class ColumnDynamic {
     ...
-    WrappedPtr variant_column;      // 实际的数据存储: ColumnVariant
-    ColumnVariant* variant_column_ptr; // 为性能保存直接指针
-    VariantInfo variant_info;       // 描述 Dynamic 当前所有变体的类型信息
+    WrappedPtr variant_column;      // Actual data storage: ColumnVariant
+    ColumnVariant* variant_column_ptr; // Direct pointer retained for performance
+    VariantInfo variant_info;       // Type information for all current Dynamic variants
     ...
 }
 ```
-二、内部组成结构（内存层）
+### 2. Internal Structure (Memory Layer)
 
-核心: Dynamic 实际上 就是一个可扩展的 Variant，每种实际出现的类型（Int32、String、Array、Map、...）被封装为一个 subcolumn（子列），并且由一个 discriminator（类型标识符）记录每行属于哪个类型。
-| 层级         | 对象                               | 说明                                                           |
+At its core, `Dynamic` is an extensible `Variant`. Each type that actually occurs (`Int32`, `String`, `Array`, `Map`, etc.) is stored in a subcolumn, while a discriminator (type identifier) records the type of each row.
+| Layer         | Object                               | Description                                                           |
 | ---------- | -------------------------------- | ------------------------------------------------------------ |
-| **顶层列对象**  | `ColumnDynamic`                  | 表面上是一个普通列                                                    |
-| **内部变体列**  | `ColumnVariant`                  | 实际存储所有动态类型的数据                                                |
-| **变体映射信息** | `VariantInfo`                    | 记录每个类型对应的 discriminator（编号）和类型名                              |
-| **子列集合**   | `ColumnVariant::columns[]`       | 每种类型对应一个子列（`ColumnVector`, `ColumnString`, `ColumnArray`, 等） |
-| **共享类型列**  | `SharedVariant` (`ColumnString`) | 当出现太多类型时，新类型序列化后以二进制格式写入此列                                   |
+| **Top-level column**  | `ColumnDynamic`                  | Exposed as a regular column                                                    |
+| **Internal variant column**  | `ColumnVariant`                  | Stores the data for all dynamic types                                                |
+| **Variant mapping metadata** | `VariantInfo`                    | Maps each type to its discriminator (numeric ID) and type name                              |
+| **Subcolumn collection**   | `ColumnVariant::columns[]`       | One subcolumn per type (`ColumnVector`, `ColumnString`, `ColumnArray`, etc.) |
+| **Shared-type column**  | `SharedVariant` (`ColumnString`) | When too many types occur, values of new types are serialized into this column in binary format                                   |
 
-结构示意图：
+Structure overview:
 ```
 ColumnDynamic
  └── ColumnVariant
-      ├── discriminator[]  ← UInt8 向量，表示每行属于哪个类型
-      ├── offsets[]        ← 索引偏移量
+      ├── discriminator[]  ← UInt8 vector indicating the type of each row
+      ├── offsets[]        ← Index offsets
       ├── variants:
       │    ├── [0]: ColumnUInt32
       │    ├── [1]: ColumnString
@@ -62,15 +62,15 @@ ColumnDynamic
       │    └── [255]: ColumnString (SharedVariant)
       └── ...
 ```
-三、磁盘存储结构（MergeTree 层）
+### 3. On-Disk Storage Structure (MergeTree Layer)
 
-在 MergeTree part 文件中，Dynamic 列的物理布局是由内部的 ColumnVariant 决定的。
-每个变体类型都对应独立的数据流（data stream），以类似如下命名规则存储：
+In a MergeTree part, the physical layout of a `Dynamic` column is determined by its internal `ColumnVariant`.
+Each variant type has a separate data stream stored using a naming convention similar to:
 ```
 column_name.variant_<type>.<stream_suffix>
 ```
-如果表中插入的 Dynamic 值有 3 种类型（UInt32、String、Array(UInt32)），
-那么磁盘上会出现大致这样的文件结构：
+If the `Dynamic` values inserted into a table have three types (`UInt32`, `String`, and `Array(UInt32)`),
+the resulting on-disk layout is approximately:
 ```
 t/
  ├── dyn.variant_UInt32.bin
@@ -79,46 +79,46 @@ t/
  ├── dyn.variant_String.mrk3
  ├── dyn.variant_Array_UInt32.bin
  ├── dyn.variant_Array_UInt32.mrk3
- ├── dyn.discriminators.bin      ← 存放每行类型编号
- ├── dyn.offsets.bin             ← 行偏移表
+ ├── dyn.discriminators.bin      ← Stores the type ID for each row
+ ├── dyn.offsets.bin             ← Row offset table
  └── ...
 ```
 
-四、动态类型扩展机制
+### 4. Dynamic Type Expansion
 
-当你插入一个新类型的值时：
+When a value of a new type is inserted:
 
 void ColumnDynamic::insert(const Field & x)
 
 
-内部会发生以下操作：
-1. 调用 x.getType() 检查该值的类型；
-2. 查询 variant_info.variant_name_to_discriminator；
-3. 如果该类型已存在：
-    - 直接写入对应的子列；
-4. 如果该类型是新类型且还未超限：
-    - 调用 addNewVariant()；
-    - 在 ColumnVariant 内扩展一个新子列；
-    - 更新 variant_info 映射；
-5. 如果已超出 max_dynamic_types 限制：
-    - 调用 insertValueIntoSharedVariant()；
-    - 将值序列化成二进制写入 SharedVariant (ColumnString)。
+The following operations occur internally:
+1. Call `x.getType()` to determine the value's type.
+2. Look up the type in `variant_info.variant_name_to_discriminator`.
+3. If the type already exists:
+    - Write the value directly to the corresponding subcolumn.
+4. If it is a new type and the limit has not been reached:
+    - Call `addNewVariant()`.
+    - Add a new subcolumn to `ColumnVariant`.
+    - Update the `variant_info` mapping.
+5. If the `max_dynamic_types` limit has been exceeded:
+    - Call `insertValueIntoSharedVariant()`.
+    - Serialize the value to binary and write it to `SharedVariant` (`ColumnString`).
 
-五、SharedVariant 特殊通道
+### 5. The SharedVariant Fallback
 
-SharedVariant 是一种 “兜底” 类型：
-- 类型过多或无法确定时，新值序列化进 SharedVariant；
-- 序列化格式为：<type_name><binary_value>；
-- 用于保证 Dynamic 列永远不会拒绝插入任何类型。
+`SharedVariant` is a fallback type:
+- When there are too many types, or a type cannot be determined, new values are serialized into `SharedVariant`.
+- The serialization format is `<type_name><binary_value>`.
+- This ensures that a `Dynamic` column can accept values of any type.
 
 ```
 insert 1 → UInt32
 insert 'abc' → String
-insert map('k',1) → 新类型 Map(String,UInt32)
-insert tuple(1,2) → 超过限制 → SharedVariant 存为 "Tuple(UInt32,UInt32)|<bin>"
+insert map('k',1) → new type Map(String,UInt32)
+insert tuple(1,2) → limit exceeded → stored in SharedVariant as "Tuple(UInt32,UInt32)|<bin>"
 ```
-六、示例
-1. 表
+### 6. Example
+1. Create a table
 ```
 CREATE TABLE default.dynamic_merge_tree_test
 (
@@ -131,7 +131,7 @@ ENGINE = MergeTree
 ORDER BY (id, ts)
 SETTINGS index_granularity = 8192
 ```
-2. 写入数据
+2. Insert data
 ```
 INSERT INTO default.dynamic_merge_tree_test (id, name, dyn)
 SELECT
@@ -145,7 +145,7 @@ SELECT
 FROM numbers(1000000);
 ```
 
-查看wide part的磁盘文件
+Inspect the files of the wide part:
 ```
 root@ubantu64:~/work/ClickHouse/build/programs/store/a76/a7609f34-18c3-419c-a364-9f7d44d52e29/all_2_2_0# ll
 total 12292

@@ -1,6 +1,6 @@
-## `apply_mutations_on_fly`的实现原理 
+## How `apply_mutations_on_fly` works
 
-如果执行`alter ... mutations`操作之后，会在`current_mutations_by_version`中添加一个mutation的操作。
+After an `ALTER ...` mutation is executed, a mutation entry is added to `current_mutations_by_version`.
 ```
 Int64 StorageMergeTree::startMutation(const MutationCommands & commands, ContextPtr query_context)
 {
@@ -42,7 +42,7 @@ Int64 StorageMergeTree::startMutation(const MutationCommands & commands, Context
 
 
 ```
-其中`current_mutations_by_version`是一个`map`, key为递增的block number，value为一次mutation操作
+`current_mutations_by_version` is a `map` whose key is an increasing block number and whose value is a mutation operation.
 ```
     std::map<UInt64, MergeTreeMutationEntry> current_mutations_by_version;
 
@@ -84,7 +84,7 @@ MutationCommands StorageMergeTree::MutationsSnapshot::getOnFlyMutationCommandsFo
         }
 ```
 
-主要看能不能复用这个函数：
+The main question is whether this function can be reused:
 ```
 std::vector<MutationActions> AlterConversions::getMutationActions(
     const IMergeTreeDataPartInfoForReader & part_info,

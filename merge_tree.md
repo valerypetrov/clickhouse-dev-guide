@@ -1,11 +1,11 @@
-## 接口
-Storages/MergeTree/IDataPartStorage.h：它是 数据 part 存储层的抽象接口，屏蔽了底层存储的差异。底层存储系统可以使用（本地磁盘、本地 JBOD、多卷策略、对象存储 S3/MinIO等）
+## Interfaces
+`Storages/MergeTree/IDataPartStorage.h`: the abstract interface for the data-part storage layer. It hides differences between underlying storage systems such as local disks, local JBOD, multi-volume policies, and S3/MinIO object storage.
 
-Storages/MergeTree/DataPartStorageOnDiskFull.h：DataPartStorageOnDiskFull 是 MergeTree 数据 part 的存储实现类。可以直接操作文件，类似于文件系统的方式操作Part。
+`Storages/MergeTree/DataPartStorageOnDiskFull.h`: `DataPartStorageOnDiskFull` is a storage implementation for MergeTree data parts. It operates directly on files, treating a part much like a filesystem tree.
 
-Storages/MergeTree/MergeTreeDataPartBuilder.h：
+`Storages/MergeTree/MergeTreeDataPartBuilder.h`:
 
-写入数据磁盘选择
+### Selecting a disk for writes
 ```
 StackTrace::StackTrace() @ 0x00000000103f2de4
 1. DB::IVolume::IVolume(String, std::vector<std::shared_ptr<DB::IDisk>, std::allocator<std::shared_ptr<DB::IDisk>>>, unsigned long, bool, DB::VolumeLoadBalancing) @ 0x000000001580bc16
@@ -35,7 +35,7 @@ StackTrace::StackTrace() @ 0x00000000103f2de4
 ```
 reserveSpacePreferringTTLRules  ->
   tryReserveSpacePreferringTTLRules  ->
-    一般走下面的逻辑：
+    Usually follows this path:
     if (!reservation)
     {
         LOG_TRACE(log, "Trying to reserve {} using storage policy from min volume index {}", ReadableSize(expected_size), min_volume_index);
@@ -43,7 +43,7 @@ reserveSpacePreferringTTLRules  ->
     }
 
     StoragePolicy::reserve  ->
-      VolumeJBOD::reserve  -> #或者其他volume
+      VolumeJBOD::reserve  -> # or another volume
         ReservationPtr VolumeJBOD::reserve(UInt64 bytes)
         {
             /// This volume can not store data which size is greater than `max_data_part_size`

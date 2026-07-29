@@ -1,20 +1,20 @@
-### Broken Part产生原因
-当重启Server或者restart 表时，会加载Part，之后CK会对Part进行安全检查，如果通过了安全检查才会将它视为正常Part。
-没有通过安全检查的part会将它添加到`unexpected_data_parts`中。
+### Causes of Broken Parts
+When the server or a table is restarted, ClickHouse loads its parts and performs safety checks on them. A part is treated as valid only if it passes these checks.
+Parts that fail the safety checks are added to `unexpected_data_parts`.
 
-#### 添加unexpected_data_parts流程
-总入口函数在`MergeTreeData::loadDataParts`,
+#### How Parts Are Added to `unexpected_data_parts`
+The main entry point is `MergeTreeData::loadDataParts`.
 
-从磁盘加载part到内存，注意只是元信息的加载：
+The following function loads a part from disk into memory. Note that it loads only metadata:
 MergeTreeData::loadDataPart
-loadDataPart主要加载两部分的元信息
+`loadDataPart` primarily loads two groups of metadata:
 
-- MergeTreeDataPartBuilder::build()，基础信息的构建，例如根据part_type构建这个part时Compart格式还是Wide格式
-- 通过 `IMergeTreeDataPart::loadColumnsChecksumsIndexes` 来加载列信息，index信息，checksum等等
-如果之前有些异常操作（例如直接关机，此时就会产生破损part[这里主要是应该ck为了写入性能，默认不是`fsync`写磁盘]，通过[https://clickhouse.com/docs/operations/settings/merge-tree-settings#fsync_after_insert]开启）。
-之后服务重启加载表的Part时，就会很容易在上述第二步检测到破损Part。
+- `MergeTreeDataPartBuilder::build()` constructs the basic metadata, such as whether the part uses the Compact or Wide format based on `part_type`.
+- `IMergeTreeDataPart::loadColumnsChecksumsIndexes` loads column metadata, index metadata, checksums, and so on.
+If an abnormal event occurred earlier, such as an abrupt shutdown, it may have produced broken parts. For write performance, ClickHouse does not use `fsync` for disk writes by default; it can be enabled with [fsync_after_insert](https://clickhouse.com/docs/operations/settings/merge-tree-settings#fsync_after_insert).
+When the service subsequently restarts and loads the table's parts, the broken parts are likely to be detected during the second step above.
 
-如果加载的过程出现异常，便会将本次加载结果的`is_broken`设置为`true`:
+If an exception occurs during loading, `is_broken` is set to `true` for that load result:
 ```
     /// Ignore broken parts that can appear as a result of hard server restart.
     auto mark_broken = [&]
@@ -44,17 +44,17 @@ loadDataPart主要加载两部分的元信息
     };
 ```
 
-对于一个复制表：
+For a replicated table:
 
-(1) 首先从keeper的表副本路径上拉取parts znode下的所有part，这个part只是part的元信息，不包含数据.之后将所有的part名添加到`expected_parts_on_this_replica`中：
+(1) First, all parts under the `parts` znode are retrieved from the table replica path in Keeper. These entries contain only part metadata, not the data itself. All part names are then added to `expected_parts_on_this_replica`:
 ```
 std::optional<std::unordered_set<std::string>> expected_parts_on_this_replica;
 ```
-Keeper中的parts路径下添加part，产生的时机为：
-- 向表中写入数据，之后提交part到Keeper
-- 合并后的part提交到keeper
+Parts are added under the `parts` path in Keeper in the following cases:
+- Data is written to the table and the resulting part is committed to Keeper.
+- A merged part is committed to Keeper.
 
-(2) 之后在loadDataParts中会比较当前节点磁盘中所有的物理part，如果part不在`expected_parts_on_this_replica`中，则将它添加到`unexpected_disk_parts`中。对于正常存在的添加到`parts_to_load_by_disk`中：
+(2) `loadDataParts` then examines all physical parts on the current node's disks. If a part is not in `expected_parts_on_this_replica`, it is added to `unexpected_disk_parts`. Expected parts are added to `parts_to_load_by_disk`:
 ```
     std::vector<PartLoadingTree::PartLoadingInfos> parts_to_load_by_disk(disks.size());
     std::vector<PartLoadingTree::PartLoadingInfos> unexpected_parts_to_load_by_disk(disks.size());
@@ -94,29 +94,29 @@ Keeper中的parts路径下添加part，产生的时机为：
         }, Priority{0});
     }
 ```
-#### 本地part在keeper的parts
-(3) 对于`parts_to_load_by_disk`存放的part是需要加载到内存中的。
+#### Local Parts Present in Keeper's `parts` Path
+(3) Parts stored in `parts_to_load_by_disk` must be loaded into memory.
 
-  - 第一步需要构建一个加载树，通过`PartLoadingTree::build`完成。
-    因为这些 part 之间可能是包含关系（例如一个 part 是另一些小 part 合并出来的），所以需要建立一棵“包含关系”的树，来决定加载的先后顺序。此结构使得当某个 part 损坏时，可以加载它的子 part（被它覆盖的原始数据），从而“修复”数据。
+  - The first step is to build a loading tree with `PartLoadingTree::build`.
+    Parts may cover one another (for example, one part may have been merged from several smaller parts), so a containment tree is needed to determine the loading order. If a part is broken, this structure allows its child parts—the original data covered by it—to be loaded instead, thereby recovering the data.
 
-    每个 part 有如下属性：
+    Each part has the following attributes:
     - partition_id
     - min_block, max_block
     - level
     
-    多个 part 在同一个分区中有如下关系：
+    Multiple parts in the same partition may have the following relationship:
     ```
            A (covering part)
           / \
          B   C   (smaller parts)
     ```
-    PartLoadingTree 就是建这样一棵树：
-    - A 是 root
-    - B/C 是 A 的 children
-    - 如果 A 损坏，就会加载 B 和 C 来替代
+    `PartLoadingTree` builds this kind of tree:
+    - A is the root.
+    - B and C are children of A.
+    - If A is broken, B and C are loaded in its place.
    
-(4) 通过`traverse`将树中顶层part加入到`active_parts`中
+(4) `traverse` adds the top-level parts in the tree to `active_parts`:
 ```
     PartLoadingTreeNodes active_parts;
 
@@ -126,8 +126,7 @@ Keeper中的parts路径下添加part，产生的时机为：
         active_parts.emplace_back(node);
     });
 ```
-(5) 通过`loadDataPartsFromDisk`磁盘中加载`active_parts`。之后遍历加载的结果`loaded_parts`，如果加载part的表示`is_broken`为true，并且它不在从keeper上拿到的parts中。
-    则统计broken part，以及broken part的字节数：
+(5) `loadDataPartsFromDisk` loads `active_parts` from disk. The resulting `loaded_parts` are then traversed. If a loaded part has `is_broken` set to `true`, the broken-part count and byte size are recorded. Parts that are not among those retrieved from Keeper are counted separately:
     ```
         if (res.is_broken)
     {
@@ -152,7 +151,7 @@ Keeper中的parts路径下添加part，产生的时机为：
     }
     ```
 
-(6) 如果破损的part数大于mergetree setting：`max_suspicious_broken_parts`，或者破损part的字节数大于：`max_suspicious_broken_parts_bytes`。则加载part失败，进而导致server启动失败。
+(6) If the number of broken parts exceeds the MergeTree setting `max_suspicious_broken_parts`, or their total size exceeds `max_suspicious_broken_parts_bytes`, part loading fails and may prevent the server from starting.
 ```
 if (!skip_sanity_checks)
 {
@@ -179,9 +178,9 @@ if (!skip_sanity_checks)
             formatReadableSizeWithBinarySuffix((*settings)[MergeTreeSetting::max_suspicious_broken_parts_bytes]));
 }
 ```
-(7) 如果该表所在的存储不是可读或者只写一次，则将第(5)步检测到的破损part重命名为：以"broken-on-start"为前缀再加分区名，则后移动到detached目录下。
-Note：以上(3) - (7)之间都是对本地part在keeper的parts路径下part的处理流程。
-(8) 对unexpected的part处理基本与excepted的part一致：
+(7) If the storage containing the table is writable and not write-once, each broken part detected in step (5) is renamed using the `"broken-on-start"` prefix and the partition name, then moved to the `detached` directory.
+Note: Steps (3) through (7) describe how local parts that are present under Keeper's `parts` path are handled.
+(8) Unexpected parts are handled in essentially the same way as expected parts:
 ```
 for (auto & load_state : unexpected_data_parts)
 {
@@ -202,7 +201,7 @@ for (auto & load_state : unexpected_data_parts)
     }, Priority{});
 }
 ```
-(9) 对于已经覆盖了的part：
+(9) For parts that have already been covered:
 ```
 loading_tree.traverse(/*recursive=*/ true, [&](const auto & node)
 {
@@ -226,8 +225,8 @@ if (!unloaded_parts.empty() && !all_disks_are_readonly)
         [this] { loadOutdatedDataParts(/*is_async=*/ true); });
 }
 ```
-#### 本地part不在keeper的parts
-对于本地part不在keeper的parts路径中的处理是在ReplicatedMergeTreeAttachThread::runImpl中完成的
+#### Local Parts Not Present in Keeper's `parts` Path
+Local parts that are not present under Keeper's `parts` path are handled in `ReplicatedMergeTreeAttachThread::runImpl`:
 ```
 ReplicatedMergeTreeAttachThread::runImpl()  ->
   StorageReplicatedMergeTree::checkParts()  ->

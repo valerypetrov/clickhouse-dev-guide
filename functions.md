@@ -1,12 +1,12 @@
-## 如何生成函数的返回值类型
+## How to determine a function's return type
 ```
-需要实现`getReturnTypeImpl`接口:
+Implement the `getReturnTypeImpl` interface:
 DataTypePtr IFunction::getReturnTypeImpl(const DataTypes & /*arguments*/) const
 {
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "getReturnType is not implemented for {}", getName());
 }
 ```
-例如小于等于的实现`LessOrEqualsOp`,会在解析层的`resolveFunction`的`build`调用。
+For example, the less-than-or-equal implementation, `LessOrEqualsOp`, is called by `build` in the analyzer's `resolveFunction` path.
 ```
 5. DB::FunctionComparison<DB::LessOrEqualsOp, DB::NameLessOrEquals>::getReturnTypeImpl(std::vector<std::shared_ptr<DB::IDataType const>, std::allocator<std::shared_ptr<DB::IDataType const>>> const&) const @ 0x000000000c899692
 6. DB::IFunction::getReturnTypeImpl(std::vector<DB::ColumnWithTypeAndName, std::allocator<DB::ColumnWithTypeAndName>> const&) const @ 0x000000000908b0cc
@@ -16,4 +16,4 @@ DataTypePtr IFunction::getReturnTypeImpl(const DataTypes & /*arguments*/) const
 10. DB::QueryAnalyzer::resolveExpressionNode(std::shared_ptr<DB::IQueryTreeNode>&, DB::IdentifierResolveScope&, bool, bool, bool) @ 0x000000001513404a
 11. DB::QueryAnalyzer::resolveExpressionNodeList(std::shared_ptr<DB::IQueryTreeNode>&, DB::IdentifierResolveScope&, bool, bool) @ 0x000000001513360e
 ```
-`resolveFunction`用来解析一个函数。
+`resolveFunction` resolves a function.

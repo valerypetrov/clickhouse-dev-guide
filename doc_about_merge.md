@@ -1,13 +1,13 @@
-Processors/Merges/Algorithms/MergedData.cpp：存放合并后数据。
-Processors/Merges/Algorithms/MergingSortedAlgorithm.cpp：这个文件中的算子只是将多个源part中的不同Block合并到MergedData中，并不包含对相同order key行的合并操作。
-Core/SortCursor.h：用来访问MergedData中数据的迭代器。
-Processors/Merges/Algorithms/IMergingAlgorithm.h: merge算法的基类。
-Storages/MergeTree/MergeTreeSequentialSource.cpp：merge中用来读取一个part数据的算子。
-Storages/MergeTree/MergeTask.cpp：一个merge任务。其中包含了merge任务的整个执行流程。
-Storages/MergeTree/MergedBlockOutputStream.h：用来将一个part的数据序列化，并刷到磁盘。
-Storages/MergeTree/MergeTreeDataPartWriterWide.cpp：用来写Wide模式的part。
-Storages/MergeTree/MergeTreeIndexGranularity.cpp：索引粒度，包含自适应计算索引粒度的逻辑（根据Block的rows以及uncompressed_bytes）
-Storages/MergeTree/MergeTreeIndexGranularityConstant.h: 常量索引粒度，即索引粒度不会变
+`Processors/Merges/Algorithms/MergedData.cpp`: stores merged data.
+`Processors/Merges/Algorithms/MergingSortedAlgorithm.cpp`: merges different blocks from multiple source parts into `MergedData`; it does not merge rows that have the same sorting key.
+`Core/SortCursor.h`: an iterator used to access data in `MergedData`.
+`Processors/Merges/Algorithms/IMergingAlgorithm.h`: the base class for merge algorithms.
+`Storages/MergeTree/MergeTreeSequentialSource.cpp`: the processor that reads data from a part during a merge.
+`Storages/MergeTree/MergeTask.cpp`: represents a merge task and contains its complete execution flow.
+`Storages/MergeTree/MergedBlockOutputStream.h`: serializes a part's data and flushes it to disk.
+`Storages/MergeTree/MergeTreeDataPartWriterWide.cpp`: writes parts in Wide format.
+`Storages/MergeTree/MergeTreeIndexGranularity.cpp`: index granularity, including logic that calculates adaptive granularity from a block's `rows` and `uncompressed_bytes`.
+`Storages/MergeTree/MergeTreeIndexGranularityConstant.h`: constant index granularity, which does not change.
 
 
 
@@ -15,4 +15,3 @@ Storages/MergeTree/MergeTreeIndexGranularityConstant.h: 常量索引粒度，即
 <horizatol, old_part> -> blocks_are_granules = false.
 <vertical, old_part> -> blocks_are_granules = true.due to new_part, then index_granularity is not ok.
 <vertical, new_part> -> blocks_are_granules = true.due to new_part, then index_granularity is ok.
-

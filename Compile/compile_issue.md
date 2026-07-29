@@ -1,4 +1,4 @@
-### 问题表现
+### Symptoms
 
 ```
 [291/13133] Running cpp protocol buffer compiler on prompb/types.proto
@@ -15,17 +15,17 @@ cd /data/code/build/contrib/prometheus-protobufs-cmake && /data/code/build/contr
 Illegal instruction (core dumped)
 ```
 
-在编译时一直出现Illegal instruction (core dumped)。
+The build repeatedly fails with `Illegal instruction (core dumped)`.
 
-通过查看报错是protoc生成proto文件时触发这个问题：
+The error shows that the failure occurs when `protoc` generates the Protocol Buffers files:
 
 ```
 /data/code/build/contrib/google-protobuf-cmake/protoc --cpp_out 
 ```
 
-### 问题排查
+### Investigation
 
-通过gdb调试编译出来的protoc, protoc挂在了`__libc_csu_init`：
+Debugging the compiled `protoc` binary with GDB shows that it crashes in `__libc_csu_init`:
 
 ```
 GNU gdb (GDB) KylinOS 9.2-7.p02.ky10
@@ -68,14 +68,14 @@ Program received signal SIGILL, Illegal instruction.
 Backtrace stopped: previous frame identical to this frame (corrupt stack?)
 ```
 
-查看崩溃时的指令：
+Inspect the instruction at the point of the crash:
 
 ```
 (gdb) x/i $pc
 => 0xaaaaaaf52934 <_GLOBAL__I_000100+20>:       ldaprb  w8, [x8]
 ```
 
-通过`objdump`来看确实生成了`rcpc`族的指令：
+`objdump` confirms that instructions from the `rcpc` family were generated:
 
 ```
 #objdump -d protoc |grep ldaprb | head -10
@@ -91,7 +91,7 @@ Backtrace stopped: previous frame identical to this frame (corrupt stack?)
   267074:       38bfc108        ldaprb  w8, [x8]
 ```
 
-通过查看ARM手册，发现`ldaprb`属于`rcpc`族指令。`rcpc`系列的指令有：
+The ARM manual identifies `ldaprb` as an instruction in the `rcpc` family. This family includes:
 
 [LDAPP](https://developer.arm.com/documentation/ddi0602/2025-09/Base-Instructions/LDAPP--Load-acquire-RCpc-pair-of-registers-?lang=en): Load-acquire RCpc pair of registers.
 
@@ -115,16 +115,16 @@ Backtrace stopped: previous frame identical to this frame (corrupt stack?)
 
 [LDIAPP](https://developer.arm.com/documentation/ddi0602/2025-09/Base-Instructions/LDIAPP--Load-Acquire-RCpc-ordered-pair-of-registers-?lang=en): Load-Acquire RCpc ordered pair of registers.
 
-查看当前机器cpu所支持的指令特性：
+Check the instruction-set features supported by the current CPU:
 
 ```
-#lscpu |grep '标记'
-标记：                           fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma dcpop asimddp asimdfhm ssbs
+#lscpu |grep 'Flags'
+Flags:                           fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma dcpop asimddp asimdfhm ssbs
 ```
 
-当前cpu并不支持`rcpc`指令。
+This CPU does not support `rcpc` instructions.
 
-再回到ClickHouse的`cmake/cpu_features`中：
+Now return to ClickHouse's `cmake/cpu_features` configuration:
 
 ```
 if (NO_ARMV81_OR_HIGHER)
@@ -170,16 +170,16 @@ if (NO_ARMV81_OR_HIGHER)
     endif ()
 ```
 
-对于ARMv8.2，它会添加`-march=armv8.2-a+simd+crypto+dotprod+ssbs+rcpc+bf16`指导编译器可以根据这些指令构建二进制：
+For ARMv8.2, it adds `-march=armv8.2-a+simd+crypto+dotprod+ssbs+rcpc+bf16`, allowing the compiler to use these instruction-set extensions when building the binary:
 
 ```
 set (COMPILER_FLAGS "${COMPILER_FLAGS} -march=armv8.2-a+simd+crypto+dotprod+ssbs+rcpc+bf16")
 ```
 
-其中包含了`rcpc`系列指令。
+This includes the `rcpc` instruction family.
 
-### 问题总结
+### Summary
 
-该问题是由于目标 CPU 不支持 ARMv8.2 架构中引入的 `rcpc` 指令集所致。解决办法是修改编译配置，禁用对该指令集的支持。
+The issue occurs because the target CPU does not support the `rcpc` instruction-set extension introduced in ARMv8.2. To resolve it, update the build configuration to disable `rcpc` support.
 
-去除对 `rcpc` 的支持后，可能会影响这些优化特性，导致性能回退。对其余特性无影响。
+Disabling `rcpc` may prevent the corresponding optimizations and reduce performance, but it does not affect the other enabled features.

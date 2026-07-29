@@ -1,13 +1,13 @@
-## 工具类
-1. 如何打印堆栈到日志？
+## Utilities
+1. How do you print a stack trace to the log?
 ```
-头文件
+Header file
 #include <Common/StackTrace.h>
 
-调用：StackTrace().toString()
+Call: StackTrace().toString()
 ```
-## 日志打印
-1.打印`ColumnsDescription`
+## Logging
+1. Print `ColumnsDescription`
 ```
 String ColumnsDescription::toString(bool include_comments) const
 {
@@ -24,7 +24,7 @@ String ColumnsDescription::toString(bool include_comments) const
     return buf.str();
 }
 ```
-2.打印`NameAndTypePair`
+2. Print `NameAndTypePair`
 ```
 String NameAndTypePair::dump() const
 {
@@ -37,7 +37,7 @@ String NameAndTypePair::dump() const
     return out.str();
 }
 ```
-3. 打印`ColumnWithTypeAndName`
+3. Print `ColumnWithTypeAndName`
 ```
 String ColumnWithTypeAndName::dumpStructure() const
 {
@@ -82,7 +82,7 @@ String MergeTreeReadTaskColumns::dump() const
     return s.str();
 }
 ```
-6. `ActionsDAG`(跟表达式有关)
+6. `ActionsDAG` (related to expressions)
 ```
 std::string ActionsDAG::dumpDAG() const
 {
@@ -191,7 +191,7 @@ std::string ExpressionActions::dumpActions() const
     return ss.str();
 }
 ```
-8. 打印Block中的所有数据
+8. Print all data in a Block
 ```
 # Block additional_columns;
 

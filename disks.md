@@ -1,32 +1,32 @@
-## 相关文件
-Disks/IVolume.h：抽象出来的磁盘逻辑卷，其中包含了Disk，以及磁盘选择算法ROUND_ROBIN（轮询），LEAST_USED（最少使用）。
+## Related files
+`Disks/IVolume.h`: the logical-volume abstraction. It contains disks and the `ROUND_ROBIN` and `LEAST_USED` disk-selection algorithms.
 
-Disks/VolumeJBOD.h：实现了 JBOD (Just a Bunch Of Disks) 模式，
-- 多个磁盘组成一个卷，但不做 RAID，也不做数据复制。
+`Disks/VolumeJBOD.h`: implements JBOD (Just a Bunch Of Disks):
 
-- 当写入新数据 part 时，会按照负载均衡策略选择一个磁盘去存储。
+- Multiple disks form one volume without RAID or data replication.
+
+- When a new data part is written, a disk is selected according to the load-balancing policy.
+
+`Disks/registerDisks.cpp`: registers every disk type.
+
+`Disks/ObjectStorages/RegisterDiskObjectStorage.h`: registers object-storage disk types and contains the creator.
+
+`Disks/DiskLocal.cpp`: registers local disks.
+
+`Disks/ObjectStorages/ObjectStorageFactory.cpp`: factory for object-storage disks.
+
+`Disks/ObjectStorages/S3/S3ObjectStorage.h`: abstraction for S3 object storage.
+
+`Disks/DiskSelector.cpp`: disk selector containing all created disks.
+
+`Disks/ObjectStorages/MetadataStorageFactory.cpp`: factory for metadata storage.
+
+`Disks/DiskFactory.cpp`: disk factory. Object-storage disks require both object storage and metadata storage.
 
 
-Disks/registerDisks.cpp:注册所有类型的磁盘。
+disk0: MetadataStorageFromPlainObjectStorageTransaction
 
-Disks/ObjectStorages/RegisterDiskObjectStorage.h：包含注册类型为对象存储的磁盘.其中包含了creator。
-
-Disks/DiskLocal.cpp: 注册本地磁盘
-
-Disks/ObjectStorages/ObjectStorageFactory.cpp：创建对象存储类型磁盘的工厂类。
-
-Disks/ObjectStorages/S3/S3ObjectStorage.h: 对S3对象存储的抽象。
-
-Disks/DiskSelector.cpp：磁盘选择器。包含所有已经创建的磁盘。
-
-Disks/ObjectStorages/MetadataStorageFactory.cpp：元信息存储创建工厂类。
-
-Disks/DiskFactory.cpp: 创建磁盘工厂类。对于对象存储的磁盘，它需要对象存储以及元信息存储。
-
-
-disk0：MetadataStorageFromPlainObjectStorageTransaction
-
-disk1：MetadataStorageFromDiskTransaction
+disk1: MetadataStorageFromDiskTransaction
 
 disk0: MetadataStorageFromPlainObjectStorage
 

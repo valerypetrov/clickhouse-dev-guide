@@ -1,31 +1,31 @@
-# Text 索引：写入与查询
+# Text Index: Writes and Queries
 
-基于 ClickHouse 26.2 源码（`MergeTreeIndexText.h/cpp`、`MergeTreeDataPartWriterOnDisk.cpp`、`MergeTreeDataSelectExecutor.cpp`、`MergeTreeReaderTextIndex.cpp`）整理。
+Based on the ClickHouse 26.2 source code (`MergeTreeIndexText.h/cpp`, `MergeTreeDataPartWriterOnDisk.cpp`, `MergeTreeDataSelectExecutor.cpp`, and `MergeTreeReaderTextIndex.cpp`).
 
-Text 索引是一种 **倒排 skip index**：对 part 内行做分词，为每个 token 维护 posting list（行号集合），序列化到 **3 个文件**（`.idx` / `.dct` / `.pst`）；查询时用倒排与 PK mark 行区间求交做裁剪。
+A text index is an **inverted skip index**: it tokenizes rows within a part, maintains a posting list (a set of row numbers) for each token, and serializes the result into **three files** (`.idx` / `.dct` / `.pst`). At query time, it prunes data by intersecting the inverted index with the row range of each PK mark.
 
 ---
 
-## 1. 整体写入流程
+## 1. Overall Write Flow
 
 ```mermaid
 flowchart TD
-    A["INSERT / Merge 写 data part"] --> B["MergeTreeDataPartWriterOnDisk::calculateAndSerializeSkipIndices"]
+    A["INSERT / Merge writes a data part"] --> B["MergeTreeDataPartWriterOnDisk::calculateAndSerializeSkipIndices"]
     B --> C["MergeTreeIndexAggregatorText::update"]
-    C --> D["Preprocessor 预处理列"]
-    D --> E["Tokenizer 分词"]
+    C --> D["Preprocessor transforms the column"]
+    D --> E["Tokenizer tokenizes it"]
     E --> F["GranuleBuilder: token → posting list"]
-    F --> G{"累积满 index.granularity 个 PK granule?<br/>text 固定为 100000000 ≈ 整 part 一份"}
-    G -->|是| H["build() → MergeTreeIndexGranuleTextWritable"]
+    F --> G{"Accumulated index.granularity PK granules?<br/>text is fixed at 100000000 ≈ one index per entire part"}
+    G -->|yes| H["build() → MergeTreeIndexGranuleTextWritable"]
     H --> I["serializeBinaryWithMultipleStreams"]
-    I --> J[".idx 稀疏索引"]
-    I --> K[".dct 词典块"]
+    I --> J[".idx sparse index"]
+    I --> K[".dct dictionary blocks"]
     I --> L[".pst Posting Lists"]
 ```
 
-### 核心代码路径
+### Key Code Paths
 
-**Part 写入时触发 skip index 计算**（`MergeTreeDataPartWriterOnDisk.cpp`）：
+**A part write triggers skip-index calculation** (`MergeTreeDataPartWriterOnDisk.cpp`):
 
 ```cpp
 void MergeTreeDataPartWriterOnDisk::calculateAndSerializeSkipIndices(...)
@@ -42,7 +42,7 @@ void MergeTreeDataPartWriterOnDisk::calculateAndSerializeSkipIndices(...)
 }
 ```
 
-**内存中构建倒排表**（`MergeTreeIndexText.cpp`）：
+**Building the inverted index in memory** (`MergeTreeIndexText.cpp`):
 
 ```cpp
 void MergeTreeIndexTextGranuleBuilder::addDocument(std::string_view document)
@@ -56,13 +56,13 @@ void MergeTreeIndexTextGranuleBuilder::addDocument(std::string_view document)
 }
 ```
 
-### 源码注释摘要
+### Summary of Source-Code Comments
 
-`MergeTreeIndexText.h` 中的设计说明：
+Design notes from `MergeTreeIndexText.h`:
 
-- Text index 是 skip index，在 granule 内对**所有文档**计算，内部用行号做 posting。
-- **`GRANULARITY` 对 text 无效**：解析时被强制为 `100000000`（`DEFAULT_TEXT_INDEX_GRANULARITY`），等价于「整 part 一份倒排」。
-- Merge 时 text index **可以合并**（`MergeTextIndexesTask`），不必每次重建。
+- The text index is a skip index computed over **all documents** in a granule; internally, its postings contain row numbers.
+- **`GRANULARITY` has no effect on text indexes**: during parsing, it is forced to `100000000` (`DEFAULT_TEXT_INDEX_GRANULARITY`), effectively creating one inverted index for the entire part.
+- Text indexes **can be merged** during a merge (`MergeTextIndexesTask`), so they do not need to be rebuilt every time.
 
 ```cpp
 // Parsers/ASTIndexDeclaration.cpp
@@ -73,68 +73,68 @@ if (type && type->name == "text")
 
 ---
 
-## 2. 落盘文件：3 个数据流 + 3 个 marks
+## 2. On-Disk Files: Three Data Streams + Three Mark Files
 
 ```cpp
 // MergeTreeIndexText::getSubstreams()
 {
-    {Regular,              "",   ".idx"},   // 稀疏索引
-    {TextIndexDictionary,  ".dct", ".idx"}, // 词典块
+    {Regular,              "",   ".idx"},   // sparse index
+    {TextIndexDictionary,  ".dct", ".idx"}, // dictionary blocks
     {TextIndexPostings,    ".pst", ".idx"}  // Posting Lists
 }
 ```
 
-以 `INDEX idx_tags tags TYPE text(tokenizer = 'array')` 为例，data part 目录下会有：
+For `INDEX idx_tags tags TYPE text(tokenizer = 'array')`, the data-part directory contains:
 
 ```
 all_1_1_0/
-├── skp_idx_idx_tags.idx       ← 稀疏索引（token → .dct 偏移）
-├── skp_idx_idx_tags.idx.mrk2  ← .idx 的 mark
-├── skp_idx_idx_tags.dct       ← 词典块（token + posting 元信息）
+├── skp_idx_idx_tags.idx       ← sparse index (token → .dct offset)
+├── skp_idx_idx_tags.idx.mrk2  ← .idx mark
+├── skp_idx_idx_tags.dct       ← dictionary blocks (token + posting metadata)
 ├── skp_idx_idx_tags.dct.mrk2
-├── skp_idx_idx_tags.pst       ← 大 posting list 的 Roaring Bitmap
+├── skp_idx_idx_tags.pst       ← Roaring Bitmap for large posting lists
 └── skp_idx_idx_tags.pst.mrk2
 ```
 
-索引文件名前缀为 `skp_idx_`（`MergeTreeIndices.cpp` 中 `INDEX_FILE_PREFIX`）。
+Index filenames use the `skp_idx_` prefix (`INDEX_FILE_PREFIX` in `MergeTreeIndices.cpp`).
 
 ```mermaid
 graph TB
-    subgraph Part["Data Part 目录"]
-        IDX["skp_idx_xxx.idx<br/>稀疏索引"]
-        DCT["skp_idx_xxx.dct<br/>词典块"]
+    subgraph Part["Data Part Directory"]
+        IDX["skp_idx_xxx.idx<br/>Sparse index"]
+        DCT["skp_idx_xxx.dct<br/>Dictionary blocks"]
         PST["skp_idx_xxx.pst<br/>Posting Lists"]
     end
 
-    IDX -->|"首 token → offset"| DCT
-    DCT -->|"大 posting: offset + min/max row"| PST
-    DCT -->|"小 posting: 内嵌在 .dct"| DCT
+    IDX -->|"first token → offset"| DCT
+    DCT -->|"large posting: offset + min/max row"| PST
+    DCT -->|"small posting: embedded in .dct"| DCT
 ```
 
-| 文件 | 内容 |
+| File | Contents |
 |------|------|
-| `.idx` | 稀疏索引：每个 dictionary block 的**首 token** → 该 block 在 `.dct` 中的文件偏移 |
-| `.dct` | 词典块：token 列表 + 每个 token 的 posting 元信息；小 posting 直接内嵌 |
-| `.pst` | 大 posting list：Roaring Bitmap 或 raw VarUInt 行号（按 block 切分） |
+| `.idx` | Sparse index: the **first token** of each dictionary block → the block's file offset in `.dct` |
+| `.dct` | Dictionary blocks: token list + posting metadata for each token; small postings are embedded directly |
+| `.pst` | Large posting lists: Roaring Bitmap or raw VarUInt row numbers (split into blocks) |
 
-`.idx` 和 `.dct` 走压缩写缓冲；`.pst` **不走** write buffer 压缩（posting 构建时已隐式压缩）。
+`.idx` and `.dct` use the compressed write buffer; `.pst` **does not** use write-buffer compression (postings are already implicitly compressed while being built).
 
 ---
 
-## 3. 内存构建：倒排表
+## 3. In-Memory Construction: The Inverted Index
 
-Text 索引是**倒排索引**。Posting list 存的是 **skip index granule 内的行号**（0-based），不是全局行号。
+The text index is an **inverted index**. A posting list stores **row numbers within the skip-index granule** (0-based), not global row numbers.
 
-### 举例
+### Example
 
 ```sql
 CREATE TABLE demo (
     id UInt64,
     tags Array(String),
-    INDEX idx_tags tags TYPE text(tokenizer = 'array')  -- GRANULARITY 会被强制为 100000000
+    INDEX idx_tags tags TYPE text(tokenizer = 'array')  -- GRANULARITY is forced to 100000000
 ) ENGINE = MergeTree
 ORDER BY id
-SETTINGS index_granularity = 4;  -- 4 行 = 1 个 PK mark；text 倒排覆盖整个 part
+SETTINGS index_granularity = 4;  -- 4 rows = 1 PK mark; the text inverted index covers the entire part
 
 INSERT INTO demo VALUES
 (0, ['api','web']),
@@ -143,11 +143,11 @@ INSERT INTO demo VALUES
 (3, ['canary']);
 ```
 
-`tokenizer='array'` 时，每个 array 元素就是一个 token（不再切分）。
+With `tokenizer='array'`, each array element is one token (with no further splitting).
 
-内存中的倒排表：
+The in-memory inverted index:
 
-| token | posting list（granule 内行号） | cardinality |
+| token | posting list (row numbers within the granule) | cardinality |
 |-------|----------------------------------|-------------|
 | `api` | {0, 2} | 2 |
 | `web` | {0} | 1 |
@@ -156,14 +156,14 @@ INSERT INTO demo VALUES
 
 ```mermaid
 graph LR
-    subgraph Rows["4 行数据"]
+    subgraph Rows["4 rows of data"]
         R0["row0: api,web"]
         R1["row1: batch"]
         R2["row2: api"]
         R3["row3: canary"]
     end
 
-    subgraph Inv["倒排索引（内存）"]
+    subgraph Inv["Inverted index (in memory)"]
         T1["api → {0,2}"]
         T2["web → {0}"]
         T3["batch → {1}"]
@@ -177,9 +177,9 @@ graph LR
     R3 --> T4
 ```
 
-### Array(String) 列的写入逻辑
+### Write Logic for an Array(String) Column
 
-对 `Array(String)` 列，每行先遍历所有元素调用 `addDocument`，再 `incrementCurrentRow()`：
+For an `Array(String)` column, all elements in each row are passed to `addDocument` before `incrementCurrentRow()` is called:
 
 ```cpp
 if (isArray(index_column.type))
@@ -188,22 +188,22 @@ if (isArray(index_column.type))
     {
         for (size_t element_idx = column_offsets[i - 1]; element_idx < column_offsets[i]; ++element_idx)
         {
-            granule_builder.addDocument(ref);  // 每个 array 元素
+            granule_builder.addDocument(ref);  // each array element
         }
         granule_builder.incrementCurrentRow();
     }
 }
 ```
 
-对普通 `String` 列，整行作为一个 document，由 tokenizer（如 `splitByNonAlpha`）切词。
+For a regular `String` column, the entire row is treated as one document and tokenized by a tokenizer such as `splitByNonAlpha`.
 
 ---
 
-## 4. `addDocument` 做了什么：往哪些内存结构写
+## 4. What `addDocument` Does: Which In-Memory Structures It Writes
 
-`addDocument` 是倒排表的**单文档写入入口**。它不落盘，只更新 `MergeTreeIndexTextGranuleBuilder` 里的内存结构。真正写 `.idx/.dct/.pst` 发生在后续 `build()` → `serializeBinaryWithMultipleStreams`。
+`addDocument` is the inverted index's **single-document write entry point**. It does not write to disk; it only updates the in-memory structures in `MergeTreeIndexTextGranuleBuilder`. The actual writes to `.idx/.dct/.pst` happen later in `build()` → `serializeBinaryWithMultipleStreams`.
 
-### 4.1 源码逐步拆解
+### 4.1 Source Code, Step by Step
 
 ```cpp
 void MergeTreeIndexTextGranuleBuilder::addDocument(std::string_view document)
@@ -217,82 +217,82 @@ void MergeTreeIndexTextGranuleBuilder::addDocument(std::string_view document)
             bool inserted;
             TokenToPostingsBuilderMap::LookupResult it;
 
-            // ① 把 token 字符串拷进 arena，作为 hashmap 的 key
+            // ① Copy the token string into the arena for use as the hashmap key
             ArenaKeyHolder key_holder{std::string_view(token_start, token_length), *arena};
             tokens_map.emplace(key_holder, it, inserted);
 
-            // ② 取出该 token 的 PostingListBuilder，写入当前行号
+            // ② Get this token's PostingListBuilder and write the current row number
             auto & posting_list_builder = it->getMapped();
             posting_list_builder.add(static_cast<UInt32>(current_row), posting_lists);
 
-            // ③ 统计处理过的 token 次数（含重复 token）
+            // ③ Count processed token occurrences (including duplicate tokens)
             ++num_processed_tokens;
-            return false;  // false = 继续切下一个 token
+            return false;  // false = continue with the next token
         });
 }
 ```
 
-| 步骤 | 动作 | 写入的内存结构 |
+| Step | Action | In-memory structure written |
 |------|------|----------------|
-| ① 分词 | `forEachTokenPadded` 用 tokenizer 切出每个 token | 只读 `document`，不写结构 |
-| ② 存 key | `ArenaKeyHolder` 把 token 字节拷到 arena | **`arena`** |
-| ③ 建/查映射 | `tokens_map.emplace`：新 token 插入，已有则复用 | **`tokens_map`**（`StringHashMap<PostingListBuilder>`） |
-| ④ 写行号 | `posting_list_builder.add(current_row, posting_lists)` | **`PostingListBuilder`**（small 数组）或 **`posting_lists`**（Roaring） |
-| ⑤ 计数 | `++num_processed_tokens` | **`num_processed_tokens`** |
+| ① Tokenize | `forEachTokenPadded` uses the tokenizer to extract each token | Reads `document` only; does not write a structure |
+| ② Store key | `ArenaKeyHolder` copies the token bytes into the arena | **`arena`** |
+| ③ Create/find mapping | `tokens_map.emplace`: insert a new token or reuse an existing one | **`tokens_map`** (`StringHashMap<PostingListBuilder>`) |
+| ④ Write row number | `posting_list_builder.add(current_row, posting_lists)` | **`PostingListBuilder`** (small array) or **`posting_lists`** (Roaring) |
+| ⑤ Count | `++num_processed_tokens` | **`num_processed_tokens`** |
 
-注意：`addDocument` **不推进行号**。行号由外层 `incrementCurrentRow()` 在处理完该行所有 document 后才 `++current_row`。
+Note: `addDocument` **does not advance the row number**. The outer `incrementCurrentRow()` increments `current_row` only after all documents for the row have been processed.
 
-### 4.2 GranuleBuilder 的内存结构总览
+### 4.2 Overview of GranuleBuilder's In-Memory Structures
 
 ```mermaid
 flowchart TB
     subgraph Builder["MergeTreeIndexTextGranuleBuilder"]
-        CR["current_row: UInt64<br/>当前行号（写入 posting 用）"]
-        NT["num_processed_tokens: UInt64<br/>累计切出的 token 次数"]
+        CR["current_row: UInt64<br/>Current row number (written to postings)"]
+        NT["num_processed_tokens: UInt64<br/>Cumulative number of extracted tokens"]
         TM["tokens_map<br/>StringHashMap&lt;PostingListBuilder&gt;<br/>token → posting builder"]
-        PL["posting_lists<br/>std::list&lt;Roaring&gt;<br/>大 posting 的真正持有者"]
-        AR["arena<br/>Arena<br/>token 字符串字节池"]
+        PL["posting_lists<br/>std::list&lt;Roaring&gt;<br/>Actual owner of large postings"]
+        AR["arena<br/>Arena<br/>Token-string byte pool"]
     end
 
-    TM -->|"key 指向"| AR
-    TM -->|"cardinality &lt; 6: 行号存在 builder.small[]"| TM
-    TM -->|"cardinality ≥ 6: builder.large 指向"| PL
+    TM -->|"key points to"| AR
+    TM -->|"cardinality &lt; 6: row numbers are in builder.small[]"| TM
+    TM -->|"cardinality ≥ 6: builder.large points to"| PL
 ```
 
-各结构职责：
+Responsibilities of each structure:
 
-| 成员 | 类型 | 作用 |
+| Member | Type | Purpose |
 |------|------|------|
-| `current_row` | `UInt64` | 当前正在索引的行号（granule 内 0-based） |
-| `num_processed_tokens` | `UInt64` | 累计 token 出现次数（同一 token 多行会多次 +1） |
-| `tokens_map` | `StringHashMap<PostingListBuilder>` | 倒排主表：token → posting builder |
-| `posting_lists` | `std::list<PostingList>`（即 `list<Roaring>`） | 仅当某 token 行号 ≥ 6 时，Roaring 对象挂在这里；用 `list` 保证指针稳定 |
-| `arena` | `Arena` | 存放 token 字符串副本，hashmap key 指向这里，避免反复分配 |
+| `current_row` | `UInt64` | Row number currently being indexed (0-based within the granule) |
+| `num_processed_tokens` | `UInt64` | Cumulative token occurrence count (the same token in multiple rows increments it multiple times) |
+| `tokens_map` | `StringHashMap<PostingListBuilder>` | Main inverted-index table: token → posting builder |
+| `posting_lists` | `std::list<PostingList>` (that is, `list<Roaring>`) | Holds the Roaring object only when a token has at least 6 row numbers; `list` keeps pointers stable |
+| `arena` | `Arena` | Stores copies of token strings; hashmap keys point here to avoid repeated allocation |
 
-`PostingListBuilder` 本身是 **union 优化**：
+`PostingListBuilder` itself uses a **union optimization**:
 
 ```
-PostingListBuilder（约 24 字节）
-├─ small_size < 6  →  small[6]：栈上 UInt32 数组存行号
-└─ small_size ≥ 6  →  large.postings → posting_lists 里的 Roaring
-                      large.context  → BulkContext（加速连续插入）
+PostingListBuilder (about 24 bytes)
+├─ small_size < 6  →  small[6]: an on-stack UInt32 array holding row numbers
+└─ small_size ≥ 6  →  large.postings → a Roaring object in posting_lists
+                      large.context  → BulkContext (accelerates sequential insertion)
 ```
 
-### 4.3 示例：逐步看内存怎么变
+### 4.3 Example: How Memory Changes Step by Step
 
-沿用前面的 4 行数据，`tokenizer = 'array'`，`current_row` 从 0 开始。
+Using the preceding four rows with `tokenizer = 'array'`, `current_row` starts at 0.
 
-#### 初始状态
+#### Initial State
 
 ```
 current_row = 0
 tokens_map  = {}
 posting_lists = []
-arena = (空)
+arena = (empty)
 num_processed_tokens = 0
 ```
 
-#### 处理 row0：`addDocument("api")` 然后 `addDocument("web")`
+#### Processing row0: `addDocument("api")`, Then `addDocument("web")`
 
 ```mermaid
 sequenceDiagram
@@ -303,36 +303,36 @@ sequenceDiagram
     participant PLB as PostingListBuilder
 
     Doc->>Tok: forEachTokenPadded
-    Tok->>Arena: 拷贝 "api" 字节
-    Tok->>Map: emplace("api") → 新建 builder
+    Tok->>Arena: Copy the bytes of "api"
+    Tok->>Map: emplace("api") → create a builder
     Map->>PLB: add(0)
     Note over PLB: small=[0], small_size=1
 ```
 
-处理完 row0 两个 token 后：
+After processing both tokens in row0:
 
 ```
-current_row = 0  （尚未 increment）
+current_row = 0  (not incremented yet)
 arena: ["api", "web"]
 tokens_map:
   "api" → PostingListBuilder{ small=[0], size=1 }
   "web" → PostingListBuilder{ small=[0], size=1 }
-posting_lists: []   ← 还没人升级到 Roaring
+posting_lists: []   ← no builder has been promoted to Roaring yet
 num_processed_tokens = 2
 ```
 
-然后外层调用 `incrementCurrentRow()` → `current_row = 1`。
+The outer layer then calls `incrementCurrentRow()` → `current_row = 1`.
 
-#### 处理 row1：`addDocument("batch")` → increment → row2：`addDocument("api")`
+#### Processing row1: `addDocument("batch")` → Increment → row2: `addDocument("api")`
 
-第二次遇到 `"api"` 时：
+When `"api"` is encountered for the second time:
 
-1. `tokens_map.emplace` 发现 key 已存在（`inserted=false`）
-2. **不往 arena 再拷一份**（复用已有 key）
-3. 对该 builder 再 `add(2)` → `small=[0, 2]`
+1. `tokens_map.emplace` finds that the key already exists (`inserted=false`).
+2. It **does not copy another instance into the arena** (the existing key is reused).
+3. It calls `add(2)` on the builder again → `small=[0, 2]`.
 
 ```
-current_row = 2（处理完 row2 后会变成 3）
+current_row = 2 (it becomes 3 after row2 is processed)
 arena: ["api", "web", "batch"]
 tokens_map:
   "api"    → small=[0, 2], size=2
@@ -342,7 +342,7 @@ posting_lists: []
 num_processed_tokens = 4
 ```
 
-#### 处理 row3：`addDocument("canary")` 后最终内存态
+#### Processing row3: Final In-Memory State After `addDocument("canary")`
 
 ```mermaid
 flowchart TB
@@ -354,7 +354,7 @@ flowchart TB
         M4["canary"]
     end
 
-    subgraph Arena["arena（字符串池）"]
+    subgraph Arena["arena (string pool)"]
         direction LR
         A1["\"api\""]
         A2["\"web\""]
@@ -371,7 +371,7 @@ flowchart TB
     end
 
     subgraph PL["posting_lists"]
-        Empty["空（所有 token cardinality &lt; 6，未升级 Roaring）"]
+        Empty["Empty (all token cardinalities are &lt; 6; none promoted to Roaring)"]
     end
 
     M1 -.->|key| A1
@@ -385,94 +385,94 @@ flowchart TB
     M4 -->|value| B4
 ```
 
-### 4.4 何时写入 `posting_lists`（small → Roaring）
+### 4.4 When `posting_lists` Is Written (small → Roaring)
 
-假设同一个 granule 里 `"api"` 出现在行号 `0,1,2,3,4,5`（第 6 次插入时 `small_size` 达到 `max_small_size=6`）：
+Suppose `"api"` occurs at row numbers `0,1,2,3,4,5` in the same granule (`small_size` reaches `max_small_size=6` on the sixth insertion):
 
 ```cpp
-// PostingListBuilder::add 关键逻辑
+// Key logic in PostingListBuilder::add
 small[small_size++] = value;
 if (small_size == max_small_size)  // == 6
 {
-    large.postings = &postings_holder.emplace_back();  // 在 posting_lists 新建 Roaring
+    large.postings = &postings_holder.emplace_back();  // Create a Roaring object in posting_lists
     for (i = 0..5) large.postings->addBulk(..., small_copy[i]);
 }
-// 之后再 add() 都走 large.postings->addBulk
+// All subsequent add() calls use large.postings->addBulk
 ```
 
 ```mermaid
 flowchart TD
     A["add(row_id)"] --> B{"small_size &lt; 6 ?"}
-    B -->|是| C["写入 builder.small[]"]
-    C --> D{"刚写满 6 个？"}
-    D -->|否| E["结束（仍在 small）"]
-    D -->|是| F["posting_lists.emplace_back Roaring"]
-    F --> G["把 small[0..5] 灌进 Roaring"]
-    G --> H["builder.large 指向该 Roaring"]
-    B -->|否| I["直接 large.postings->addBulk(row_id)"]
+    B -->|yes| C["Write to builder.small[]"]
+    C --> D{"Just reached 6 entries?"}
+    D -->|no| E["Finish (still small)"]
+    D -->|yes| F["posting_lists.emplace_back Roaring"]
+    F --> G["Load small[0..5] into Roaring"]
+    G --> H["builder.large points to this Roaring object"]
+    B -->|no| I["Call large.postings->addBulk(row_id) directly"]
 ```
 
-升级后内存关系：
+In-memory relationships after promotion:
 
 ```
-tokens_map["api"].large.postings ──► posting_lists 中的某个 Roaring{0,1,2,3,4,5,...}
-tokens_map["web"].small = [0]     ──► 仍在 builder 内部，不占 posting_lists
+tokens_map["api"].large.postings ──► a Roaring{0,1,2,3,4,5,...} object in posting_lists
+tokens_map["web"].small = [0]     ──► remains inside the builder and occupies no posting_lists entry
 ```
 
-### 4.5 和后续 `build()` 的衔接
+### 4.5 Handoff to the Subsequent `build()`
 
-`addDocument` 只维护无序 hashmap。`build()` 时才会：
+`addDocument` only maintains an unordered hashmap. `build()` then:
 
-1. 遍历 `tokens_map`，收集 `(token_view, PostingListBuilder*)` 到 `SortedTokensAndPostings`
-2. **按 token 字典序排序**
-3. 把 `tokens_map / posting_lists / arena` 所有权移入 `MergeTreeIndexGranuleTextWritable`
-4. 之后序列化才写 `.idx / .dct / .pst`
+1. Iterates over `tokens_map` and collects `(token_view, PostingListBuilder*)` pairs in `SortedTokensAndPostings`.
+2. **Sorts them lexicographically by token**.
+3. Transfers ownership of `tokens_map / posting_lists / arena` to `MergeTreeIndexGranuleTextWritable`.
+4. Writes `.idx / .dct / .pst` only during subsequent serialization.
 
 ```mermaid
 flowchart LR
-    A["多次 addDocument<br/>+ incrementCurrentRow"] --> B["内存倒排<br/>tokens_map + posting_lists + arena"]
-    B --> C["build：排序 token"]
+    A["Multiple addDocument calls<br/>+ incrementCurrentRow"] --> B["In-memory inverted index<br/>tokens_map + posting_lists + arena"]
+    B --> C["build: sort tokens"]
     C --> D["serialize → .idx/.dct/.pst"]
 ```
 
-### 4.6 小结
+### 4.6 Summary
 
-| 问题 | 答案 |
+| Question | Answer |
 |------|------|
-| `addDocument` 写磁盘吗？ | **不写**，只更新内存 |
-| token 字符串存在哪？ | **`arena`** |
-| token → posting 映射在哪？ | **`tokens_map`** |
-| 行号存在哪？ | 少见 token：`PostingListBuilder.small[]`；多见 token：`posting_lists` 里的 Roaring |
-| 行号从哪来？ | 成员 **`current_row`**（由 `incrementCurrentRow` 推进，不是 `addDocument` 推进） |
-| 同一行同一 token 写两次？ | `add()` 发现与上一个值相同会 **直接 return**（去重） |
+| Does `addDocument` write to disk? | **No**; it only updates memory |
+| Where are token strings stored? | **`arena`** |
+| Where is the token → posting mapping? | **`tokens_map`** |
+| Where are row numbers stored? | Infrequent token: `PostingListBuilder.small[]`; frequent token: a Roaring object in `posting_lists` |
+| Where do row numbers come from? | The **`current_row`** member (advanced by `incrementCurrentRow`, not by `addDocument`) |
+| What if the same token is written twice in one row? | `add()` finds that the value equals the previous value and **returns immediately** (deduplication) |
 
 ---
 
-## 5. 序列化：3 个文件各写什么
+## 5. Serialization: What Is Written to Each of the Three Files
 
-### Step 1：token 排序 + 切 dictionary block
+### Step 1: Sort Tokens + Split into Dictionary Blocks
 
-1. 所有 token 按字典序排序（上例：`api, batch, canary, web`）。
-2. 按 `dictionary_block_size`（默认 **512**）切成多个 dictionary block。
-3. 本例 4 个 token → **1 个 dictionary block**。
+1. Sort all tokens lexicographically (in the preceding example: `api, batch, canary, web`).
+2. Split them into dictionary blocks according to `dictionary_block_size` (default: **512**).
+3. The four tokens in this example produce **one dictionary block**.
 
-### Step 2：写 `.dct`（词典块）
+### Step 2: Write `.dct` (Dictionary Blocks)
 
-每个 dictionary block 的二进制布局：
+Binary layout of each dictionary block:
 
 ```
 ┌─ Dictionary Block ─────────────────────────────────────┐
 │ tokens_format (VarUInt)          // 0=raw, 1=front-coded │
 │ num_tokens (VarUInt)                                     │
-│ tokens[] (ColumnString 序列化)                           │
-│ 对每个 token:                                            │
+│ tokens[] (ColumnString serialization)                    │
+│ For each token:                                          │
 │   header (VarUInt)     // Raw/Embedded/SingleBlock...  │
 │   cardinality (VarUInt)                                  │
-│   [offsets + row ranges] 或 [内嵌 posting]             │
+│   [offsets + row ranges] or [embedded posting]           │
 └──────────────────────────────────────────────────────────┘
 ```
 
-其中 `tokens_format` 由参数 `dictionary_block_frontcoding_compression` 决定（默认 `1` → FrontCoded）：
+`tokens_format` is determined by the `dictionary_block_frontcoding_compression` parameter (default: `1` → FrontCoded):
 
 ```cpp
 auto tokens_format = params.dictionary_block_frontcoding_compression
@@ -480,26 +480,26 @@ auto tokens_format = params.dictionary_block_frontcoding_compression
     : TextIndexSerialization::TokensFormat::RawStrings;         // 0
 
 // serializeTokensImpl
-writeVarUInt(static_cast<UInt64>(format), ostr);  // 先写 format
-writeVarUInt(num_tokens_in_block, ostr);          // 再写 token 数
+writeVarUInt(static_cast<UInt64>(format), ostr);  // Write the format first
+writeVarUInt(num_tokens_in_block, ostr);          // Then write the token count
 switch (format) {
     case RawStrings:         serializeTokensRaw(...); break;
     case FrontCodedStrings:  serializeTokensFrontCoding(...); break;
 }
 ```
 
-### Step 2.1：两种 token 序列化的区别
+### Step 2.1: Differences Between the Two Token Serialization Formats
 
-| | `RawStrings` (0) | `FrontCodedStrings` (1，默认) |
+| | `RawStrings` (0) | `FrontCodedStrings` (1, default) |
 |--|------------------|-------------------------------|
-| 参数 | `dictionary_block_frontcoding_compression = 0` | `= 1` |
-| 思路 | 每个 token 完整写出 | 利用**已排序** token 的公共前缀，只写后缀 |
-| 每个 token 写什么 | `len` + 完整字节 | 首 token：`len` + 完整字节；后续：`lcp` + `suffix_len` + 后缀字节 |
-| 空间 | 无压缩，体积大 | 前缀重复多时更省（如 `host.ip` / `host.name`） |
-| 读取 | 直接按 `SerializationString` 读 | 需用前一个 token 还原：`prev[0..lcp) + suffix` |
-| 适用 | 调试、token 几乎无公共前缀 | 生产默认；词典块内 token 已字典序排序 |
+| Parameter | `dictionary_block_frontcoding_compression = 0` | `= 1` |
+| Approach | Write every token in full | Exploit common prefixes among **sorted** tokens and write only the suffix |
+| Data written per token | `len` + all bytes | First token: `len` + all bytes; subsequent tokens: `lcp` + `suffix_len` + suffix bytes |
+| Space | Uncompressed and larger | More compact when prefixes repeat frequently (for example, `host.ip` / `host.name`) |
+| Reading | Read directly with `SerializationString` | Reconstruct using the previous token: `prev[0..lcp) + suffix` |
+| Use case | Debugging or tokens with almost no common prefixes | Production default; tokens within a dictionary block are already sorted lexicographically |
 
-#### RawStrings：完整存储
+#### RawStrings: Full Storage
 
 ```cpp
 // serializeTokensRaw
@@ -508,23 +508,23 @@ for each token:
     write(token.data(), token.size());
 ```
 
-假设 block 内已排序 token：`apple`, `apply`, `apricot`：
+Suppose the sorted tokens in a block are `apple`, `apply`, and `apricot`:
 
 ```
 ┌─ RawStrings ─────────────────────────────────────┐
 │ len=5 "apple" │ len=5 "apply" │ len=7 "apricot" │
 └──────────────────────────────────────────────────┘
-写出字节（示意）： 5 apple | 5 apply | 7 apricot
+Bytes written (schematic): 5 apple | 5 apply | 7 apricot
 ```
 
-#### FrontCodedStrings：前缀编码
+#### FrontCodedStrings: Prefix Encoding
 
 ```cpp
 // serializeTokensFrontCoding
-// 第一个 token：完整写出
+// First token: write it in full
 writeVarUInt(first.size()); write(first);
 
-// 后续 token：只写与前一个的公共前缀长度 + 剩余后缀
+// Subsequent tokens: write only the common-prefix length with the previous token + the remaining suffix
 for each next token:
     lcp = commonPrefixLength(previous, current);
     writeVarUInt(lcp);
@@ -532,21 +532,21 @@ for each next token:
     write(current.data() + lcp, current.size() - lcp);
 ```
 
-同一组 token（逐字符比公共前缀，遇到第一个不同字符就停）：
+For the same token set (compare the common prefix character by character and stop at the first difference):
 
 ```
-apple  vs apply   : a-p-p-l | e≠y  → LCP=4 ("appl")，后缀 = "y"
-apply  vs apricot : a-p | p≠r     → LCP=2 ("ap")，  后缀 = "ricot"
+apple  vs apply   : a-p-p-l | e≠y  → LCP=4 ("appl"), suffix = "y"
+apply  vs apricot : a-p | p≠r     → LCP=2 ("ap"),   suffix = "ricot"
 ```
 
-注意：LCP 是 **与前一个已还原 token** 比，不是与 block 首 token 比。
-`apply` 和 `apricot` 第三个字符是 `p` vs `r`，所以公共前缀是 `ap`，不是 `apr`。
+Note: the LCP is computed **against the previously reconstructed token**, not the first token in the block.
+The third characters of `apply` and `apricot` are `p` and `r`, respectively, so their common prefix is `ap`, not `apr`.
 
 ```
 ┌─ FrontCodedStrings ──────────────────────────────────────────┐
-│ [完整] len=5 "apple"                                         │
-│ [相对] lcp=4, suffix_len=1, "y"       → "appl" + "y" = apply │
-│ [相对] lcp=2, suffix_len=5, "ricot"   → "ap" + "ricot" = apricot │
+│ [full] len=5 "apple"                                         │
+│ [relative] lcp=4, suffix_len=1, "y"   → "appl" + "y" = apply │
+│ [relative] lcp=2, suffix_len=5, "ricot" → "ap" + "ricot" = apricot │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -559,84 +559,84 @@ flowchart LR
     end
 
     subgraph FC["FrontCodedStrings"]
-        F1["apple（完整）"]
+        F1["apple (full)"]
         F2["lcp=4 + 'y'"]
         F3["lcp=2 + 'ricot'"]
     end
 
-    F1 -.->|"还原"| R1
-    F1 -->|"前 4 字节 + y"| F2
-    F2 -->|"前 2 字节 + ricot"| F3
+    F1 -.->|"reconstruct"| R1
+    F1 -->|"first 4 bytes + y"| F2
+    F2 -->|"first 2 bytes + ricot"| F3
 ```
 
-#### 为何 Front Coding 有效
+#### Why Front Coding Works
 
-Dictionary block 内 token **已按字典序排序**，相邻 token 往往共享前缀（如 `api` / `app`，`host.ip` / `host.name`）。Front coding 只存差分，读时顺序扫描 block 即可还原；稀疏索引仍用每个 block 的**首 token 完整串**做二分定位，不受 front coding 影响。
+Tokens within a dictionary block are **already sorted lexicographically**, so adjacent tokens often share a prefix (for example, `api` / `app` or `host.ip` / `host.name`). Front coding stores only the differences, and a sequential scan reconstructs the block during reading. The sparse index still uses the **complete first token** of each block for binary-search positioning, so front coding does not affect it.
 
-读路径对应 `deserializeTokensRaw` / `deserializeTokensFrontCoding`：后者按 `lcp` 从上一 token 拷贝前缀，再拼后缀。
+The corresponding read paths are `deserializeTokensRaw` and `deserializeTokensFrontCoding`: the latter copies the prefix of length `lcp` from the previous token and appends the suffix.
 
 ---
 
-### Step 3：`serializePostings` 流程，以及如何影响 `.dct` 写入
+### Step 3: The `serializePostings` Flow and How It Affects `.dct` Writes
 
-每个 token 在 `serializeTokensAndPostings` 里按固定三步处理：
+Each token is processed in three fixed steps inside `serializeTokensAndPostings`:
 
 ```cpp
-// 对 dictionary block 内每个 token：
-auto token_info = serializePostings(postings, postings_stream, ...);  // ① 决策 + 可能写 .pst
-serializeTokenInfo(dictionary_stream, token_info);                    // ② 写元信息到 .dct
+// For each token in the dictionary block:
+auto token_info = serializePostings(postings, postings_stream, ...);  // ① Decide + possibly write .pst
+serializeTokenInfo(dictionary_stream, token_info);                    // ② Write metadata to .dct
 if (token_info.header & EmbeddedPostings)
-    PostingsSerialization::serialize(..., dictionary_stream);         // ③ 仅嵌入时：body 写进 .dct
+    PostingsSerialization::serialize(..., dictionary_stream);         // ③ Embedded only: write the body to .dct
 ```
 
 ```mermaid
 flowchart TD
-    Start["serializePostings(token)"] --> Card["读 cardinality"]
+    Start["serializePostings(token)"] --> Card["Read cardinality"]
     Card --> Emb{"card ≤ 6 ?"}
-    Emb -->|是| EmbPath["header = Raw|Embedded<br/>清除 IsCompressed<br/>return（不写 .pst）"]
-    Emb -->|否| Raw{"card ≤ 12 ?"}
-    Raw -->|是| RawPath["header = Raw|SingleBlock<br/>清除 IsCompressed"]
-    Raw -->|否| Single{"card ≤ posting_list_block_size ?"}
-    Single -->|是| SinglePath["header |= SingleBlock<br/>（Roaring 单块）"]
-    Single -->|否| MultiPath["header 无 SingleBlock<br/>（Roaring 多块）"]
+    Emb -->|yes| EmbPath["header = Raw|Embedded<br/>Clear IsCompressed<br/>return (do not write .pst)"]
+    Emb -->|no| Raw{"card ≤ 12 ?"}
+    Raw -->|yes| RawPath["header = Raw|SingleBlock<br/>Clear IsCompressed"]
+    Raw -->|no| Single{"card ≤ posting_list_block_size ?"}
+    Single -->|yes| SinglePath["header |= SingleBlock<br/>(one Roaring block)"]
+    Single -->|no| MultiPath["header lacks SingleBlock<br/>(multiple Roaring blocks)"]
 
-    EmbPath --> After["回到调用方"]
-    RawPath --> WritePst["写 body 到 .pst<br/>填 offsets + ranges"]
+    EmbPath --> After["Return to the caller"]
+    RawPath --> WritePst["Write body to .pst<br/>Populate offsets + ranges"]
     SinglePath --> WritePst
-    MultiPath --> Split["splitPostings 切块<br/>每块写 .pst + offset/range"]
+    MultiPath --> Split["splitPostings splits into blocks<br/>Write each block to .pst + offset/range"]
     WritePst --> After
     Split --> After
 
     After --> Info["serializeTokenInfo → .dct"]
     Info --> Emb2{"Embedded ?"}
-    Emb2 -->|是| BodyDct["body 再写进 .dct"]
-    Emb2 -->|否| Done[".dct 只有元信息<br/>body 已在 .pst"]
+    Emb2 -->|yes| BodyDct["Then write the body to .dct"]
+    Emb2 -->|no| Done[".dct contains metadata only<br/>The body is already in .pst"]
 ```
 
-阈值常量：
+Threshold constants:
 
 ```cpp
 static constexpr UInt64 MAX_CARDINALITY_FOR_EMBEDDED_POSTINGS = 6;
 static constexpr UInt64 MAX_CARDINALITY_FOR_RAW_POSTINGS = 12;
-// posting_list_block_size 默认 1048576
+// posting_list_block_size defaults to 1048576
 ```
 
-`TokenPostingsInfo` 字段：
+`TokenPostingsInfo` fields:
 
-| 字段 | 含义 |
+| Field | Meaning |
 |------|------|
-| `header` | Flags 位图（Raw / Embedded / SingleBlock / IsCompressed） |
-| `cardinality` | 行号个数 |
-| `offsets[]` | 每个 posting block 在 **`.pst` 文件**中的偏移（Embedded 时为空） |
-| `ranges[]` | 每个 block 的 `[min_row, max_row]`（Embedded 时为空） |
-| `embedded_postings` | 仅读路径使用；写路径嵌入时 body 直接追加到 `.dct` |
+| `header` | Flags bitmap (Raw / Embedded / SingleBlock / IsCompressed) |
+| `cardinality` | Number of row numbers |
+| `offsets[]` | Offset of each posting block in the **`.pst` file** (empty for Embedded postings) |
+| `ranges[]` | `[min_row, max_row]` for each block (empty for Embedded postings) |
+| `embedded_postings` | Used only on the read path; on the write path, an embedded body is appended directly to `.dct` |
 
-`serializeTokenInfo` 写进 `.dct` 的内容取决于 header：
+What `serializeTokenInfo` writes to `.dct` depends on the header:
 
 ```cpp
 writeVarUInt(header);
 writeVarUInt(cardinality);
-if (EmbeddedPostings) return;           // 不写 offset/range；body 紧随其后
+if (EmbeddedPostings) return;           // Do not write offset/range; the body immediately follows
 if (!(SingleBlock)) writeVarUInt(num_blocks);
 for each block:
     writeVarUInt(offset); writeVarUInt(range.begin); writeVarUInt(range.end);
@@ -644,127 +644,127 @@ for each block:
 
 ---
 
-#### 场景 A：Embedded（card ≤ 6）—— body 进 `.dct`，`.pst` 不写
+#### Scenario A: Embedded (card ≤ 6)—Body Goes to `.dct`; Nothing Is Written to `.pst`
 
-**示例**：token `api`，行号 `{0, 2}`，card=2。
+**Example**: token `api`, row numbers `{0, 2}`, card=2.
 
-`serializePostings`：
+`serializePostings`:
 
-1. `header = RawPostings | EmbeddedPostings`，清掉 `IsCompressed`
-2. **立刻 return**，不碰 `.pst`，`offsets/ranges` 为空
+1. Set `header = RawPostings | EmbeddedPostings` and clear `IsCompressed`.
+2. **Return immediately** without touching `.pst`; `offsets/ranges` remain empty.
 
-随后：
+Then:
 
-1. `serializeTokenInfo` → `.dct` 只写 `header` + `cardinality=2`
-2. 因 `EmbeddedPostings`，再把 body 写进 **`.dct`**：两个 VarUInt `0`, `2`
+1. `serializeTokenInfo` → write only `header` + `cardinality=2` to `.dct`.
+2. Because this is `EmbeddedPostings`, write the body to **`.dct`** as two VarUInt values, `0` and `2`.
 
 ```
-.dct 中该 token 段：
+.dct segment for this token:
 ┌─────────┬──────┬─────┬─────┐
 │ header  │ card │  0  │  2  │
 │ Raw|Emb │  2   │row  │row  │
 └─────────┴──────┴─────┴─────┘
-.pst：无此 token 数据
+.pst: no data for this token
 ```
 
 ```mermaid
 flowchart LR
-    SP["serializePostings"] -->|"只填 header+card"| Info["TokenPostingsInfo"]
+    SP["serializePostings"] -->|"Populate header+card only"| Info["TokenPostingsInfo"]
     Info --> STI["serializeTokenInfo → .dct"]
     Info --> Body["serialize body → .dct"]
-    SP -.->|"不写"| PST[".pst"]
+    SP -.->|"do not write"| PST[".pst"]
 ```
 
 ---
 
-#### 场景 B：Raw + SingleBlock（7 ≤ card ≤ 12）—— body 进 `.pst`，`.dct` 只存指针
+#### Scenario B: Raw + SingleBlock (7 ≤ card ≤ 12)—Body Goes to `.pst`; `.dct` Stores Only a Pointer
 
-**示例**：token `batch`，行号 `{1,3,5,7,9,11,13,15}`，card=8。
+**Example**: token `batch`, row numbers `{1,3,5,7,9,11,13,15}`, card=8.
 
-`serializePostings`：
+`serializePostings`:
 
-1. `header = RawPostings | SingleBlock`，清掉 `IsCompressed`
-2. 走 `SingleBlock` 分支：
-   - `offsets = [当前 .pst 写指针]`（如 `1024`）
+1. Set `header = RawPostings | SingleBlock` and clear `IsCompressed`.
+2. Take the `SingleBlock` branch:
+   - `offsets = [current .pst write position]` (for example, `1024`)
    - `ranges = [{1, 15}]`
-   - body 写入 **`.pst`**：8 个 VarUInt 行号
+   - Write the body to **`.pst`** as eight VarUInt row numbers.
 
-随后 `serializeTokenInfo` → `.dct`：
+Then `serializeTokenInfo` → `.dct`:
 
 ```
 header | card=8 | offset=1024 | min=1 | max=15
-（SingleBlock → 不写 num_blocks）
+(SingleBlock → do not write num_blocks)
 ```
 
 ```
-.dct:  [header Raw|Single][8][1024][1][15]     ← 只有元信息
+.dct:  [header Raw|Single][8][1024][1][15]     ← metadata only
 .pst:  ... | VarUInt(1)(3)(5)(7)(9)(11)(13)(15) | ...
               ↑ offset=1024
 ```
 
 ```mermaid
 flowchart LR
-    SP["serializePostings"] -->|"写 8 个 VarUInt"| PST[".pst @1024"]
-    SP -->|"填 offset+range"| Info["TokenPostingsInfo"]
+    SP["serializePostings"] -->|"Write 8 VarUInt values"| PST[".pst @1024"]
+    SP -->|"Populate offset+range"| Info["TokenPostingsInfo"]
     Info --> STI["serializeTokenInfo → .dct<br/>header,card,offset,min,max"]
 ```
 
 ---
 
-#### 场景 C：Roaring 单块（12 < card ≤ posting_list_block_size）—— `.pst` 存 Roaring
+#### Scenario C: One Roaring Block (12 < card ≤ posting_list_block_size)—`.pst` Stores Roaring
 
-**示例**：token `web`，出现在 100 行，card=100，`posting_list_block_size=1MB`。默认 codec=`none`（无 `IsCompressed`）。
+**Example**: token `web` occurs in 100 rows, card=100, and `posting_list_block_size=1MB`. The default codec is `none` (no `IsCompressed`).
 
-`serializePostings`：
+`serializePostings`:
 
-1. card>12 且 ≤ block_size → `header |= SingleBlock`（无 Raw）
-2. `offsets=[pst_pos]`，`ranges=[{min,max}]`
-3. body 写入 `.pst`：`VarUInt(nbytes)` + Roaring portable 字节
+1. card>12 and ≤ block_size → `header |= SingleBlock` (no Raw).
+2. `offsets=[pst_pos]`, `ranges=[{min,max}]`
+3. Write the body to `.pst`: `VarUInt(nbytes)` + portable Roaring bytes.
 
-`.dct` 仍只写元信息（同场景 B 结构，但 header 无 Raw）：
+`.dct` still contains only metadata (the same structure as Scenario B, but without Raw in the header):
 
 ```
 .dct:  [header SingleBlock][100][offset][min][max]
 .pst:  [nbytes][Roaring bytes...]
 ```
 
-读时：按 offset seek `.pst`，读 Roaring，不是 VarUInt 列表。
+On read: seek into `.pst` by offset and read Roaring, not a VarUInt list.
 
 ---
 
-#### 场景 D：Roaring 多块（card > posting_list_block_size）—— 切块写 `.pst`
+#### Scenario D: Multiple Roaring Blocks (card > posting_list_block_size)—Split into Blocks and Write `.pst`
 
-为便于演示，假设 `posting_list_block_size = 4`（生产默认是 1MB），token `svc` 行号：
+For illustration, suppose `posting_list_block_size = 4` (the production default is 1 MB) and token `svc` has these row numbers:
 
 ```
-{0,1,2,3,  10,11,12,13,  20,21}   → card=10，但按 Roaring 容器/阈值切成多块
+{0,1,2,3,  10,11,12,13,  20,21}   → card=10, but split into multiple blocks by Roaring container/threshold
 ```
 
-（真实切分按 Roaring 内部 container 累计 cardinality ≥ `posting_list_block_size`；这里用小阈值示意多块形态。）
+(The actual split occurs when cumulative cardinality across internal Roaring containers reaches `posting_list_block_size`; the small threshold here only illustrates the multi-block layout.)
 
-`serializePostings` 走 else 分支：
+`serializePostings` takes the `else` branch:
 
 ```cpp
 auto blocks = splitPostings(roaring, posting_list_block_size);
 for each block:
     offsets.emplace_back(pst.count());
     ranges.emplace_back(min, max);
-    serialize(block → .pst);   // 每块：nbytes + Roaring
+    serialize(block → .pst);   // Each block: nbytes + Roaring
 ```
 
-假设切成 3 块：
+Suppose it is split into three blocks:
 
-| block | rows（示意） | .pst offset | range |
+| block | rows (schematic) | .pst offset | range |
 |-------|--------------|-------------|-------|
 | 0 | {0,1,2,3} | 2000 | [0,3] |
 | 1 | {10,11,12,13} | 2100 | [10,13] |
 | 2 | {20,21} | 2200 | [20,21] |
 
-`header` **没有** `SingleBlock`，因此 `serializeTokenInfo` 会多写 `num_blocks`：
+The `header` **does not contain** `SingleBlock`, so `serializeTokenInfo` also writes `num_blocks`:
 
 ```
 .dct:
-  header（无 SingleBlock）
+  header (without SingleBlock)
   card=10
   num_blocks=3
   offset=2000, min=0,  max=3
@@ -777,30 +777,30 @@ for each block:
   @2200: roaring_block2
 ```
 
-查询某行范围时，可用 `ranges` 只读相交的 block（`TokenPostingsInfo::getBlocksToRead`），不必读全部 posting。
+When querying a row range, `ranges` lets the reader load only intersecting blocks (`TokenPostingsInfo::getBlocksToRead`) instead of the entire posting.
 
 ```mermaid
 flowchart TB
-    R["Roaring 全量 posting"] --> S["splitPostings"]
+    R["Complete Roaring posting"] --> S["splitPostings"]
     S --> B0["block0 → .pst@2000<br/>range[0,3]"]
     S --> B1["block1 → .pst@2100<br/>range[10,13]"]
     S --> B2["block2 → .pst@2200<br/>range[20,21]"]
-    B0 & B1 & B2 --> DCT[".dct: num_blocks=3<br/>+ 每块 offset/min/max"]
+    B0 & B1 & B2 --> DCT[".dct: num_blocks=3<br/>+ offset/min/max for each block"]
 ```
 
 ---
 
-#### 场景 E：`IsCompressed`（`posting_list_codec ≠ none`）
+#### Scenario E: `IsCompressed` (`posting_list_codec ≠ none`)
 
-若建表指定 `posting_list_codec = 'bitpacking'`（等），且 **不是** Embedded/Raw 小 posting：
+If the table specifies `posting_list_codec = 'bitpacking'` (or another codec) and the posting is **not** a small Embedded/Raw posting:
 
-1. 开头可能置 `IsCompressed`
-2. card≤6 时会 **强制清掉** `IsCompressed`，仍走嵌入（压缩只用于大 posting）
-3. 大 posting 走 `posting_list_codec->encode(...)`，由 codec 自己按 `posting_list_block_size` 切段并填充 `offsets/ranges`
-4. `.dct` 侧仍通过 `serializeTokenInfo` 写 header（含 `IsCompressed`）+ card + offset/range；body 在 `.pst`
+1. `IsCompressed` may be set initially.
+2. For card≤6, `IsCompressed` is **forcibly cleared**, and the posting is still embedded (compression is used only for large postings).
+3. A large posting goes through `posting_list_codec->encode(...)`; the codec splits it according to `posting_list_block_size` and populates `offsets/ranges`.
+4. On the `.dct` side, `serializeTokenInfo` still writes the header (including `IsCompressed`) + card + offset/range; the body is in `.pst`.
 
 ```cpp
-// 小 posting 强制不压缩：
+// Small postings are forcibly left uncompressed:
 if (card <= 6) {
     header |= Raw | Embedded;
     header &= ~IsCompressed;
@@ -810,29 +810,29 @@ if (card <= 6) {
 
 ---
 
-#### 四场景对照（默认 codec=`none`）
+#### Comparison of the Four Scenarios (Default codec=`none`)
 
-| 场景 | card | header | body 写到 | `.dct` 写入内容 |
+| Scenario | card | header | Body written to | Contents written to `.dct` |
 |------|------|--------|-----------|-----------------|
-| A Embedded | ≤6 | Raw\|Embedded | **`.dct`**（紧跟 meta） | header + card + **body** |
-| B Raw 单块 | 7–12 | Raw\|SingleBlock | **`.pst`**（VarUInt 列表） | header + card + offset + min + max |
-| C Roaring 单块 | 13～block_size | SingleBlock | **`.dct` 无 body**；`.pst` 为 Roaring | 同 B（header 无 Raw） |
-| D Roaring 多块 | > block_size | （无 SingleBlock） | **`.pst` 多段 Roaring** | header + card + **num_blocks** + 每块 offset/min/max |
+| A Embedded | ≤6 | Raw\|Embedded | **`.dct`** (immediately after metadata) | header + card + **body** |
+| B Raw single block | 7–12 | Raw\|SingleBlock | **`.pst`** (VarUInt list) | header + card + offset + min + max |
+| C Roaring single block | 13–block_size | SingleBlock | **No body in `.dct`**; `.pst` contains Roaring | Same as B (header without Raw) |
+| D Roaring multiple blocks | > block_size | (no SingleBlock) | **Multiple Roaring segments in `.pst`** | header + card + **num_blocks** + offset/min/max for each block |
 
 ```mermaid
 flowchart TB
-    subgraph DCT[".dct 每个 token"]
+    subgraph DCT["Each token in .dct"]
         direction TB
-        A1["A: header+card+行号 body"]
+        A1["A: header+card+row-number body"]
         B1["B/C: header+card+offset+range"]
-        D1["D: header+card+n+多组 offset/range"]
+        D1["D: header+card+n+multiple offset/range groups"]
     end
 
     subgraph PST[".pst"]
-        A2["A: 无"]
-        B2["B: VarUInt 行号"]
-        C2["C: 单块 Roaring"]
-        D2["D: 多块 Roaring"]
+        A2["A: none"]
+        B2["B: VarUInt row numbers"]
+        C2["C: one Roaring block"]
+        D2["D: multiple Roaring blocks"]
     end
 
     A1 -.-> A2
@@ -843,52 +843,52 @@ flowchart TB
 
 ---
 
-#### 和调用顺序的关系（为何 Embedded 分两步）
+#### Relationship to Call Order (Why Embedded Uses Two Steps)
 
 ```cpp
-auto token_info = serializePostings(...);   // Embedded：只决策，不写 body
-serializeTokenInfo(dct, token_info);        // 先写 header/card
+auto token_info = serializePostings(...);   // Embedded: decide only; do not write the body
+serializeTokenInfo(dct, token_info);        // Write header/card first
 if (Embedded)
-    serialize(postings → dct);              // 再写 body，保证 .dct 布局连续
+    serialize(postings → dct);              // Then write the body, keeping the .dct layout contiguous
 ```
 
-非 Embedded 时 body 已在 `serializePostings` 内写入 `.pst`，`serializeTokenInfo` 只把「去哪读」记进 `.dct`。
+For non-Embedded postings, the body has already been written to `.pst` inside `serializePostings`; `serializeTokenInfo` records only where to read it in `.dct`.
 
 ---
 
-### Step 4：写 `.idx`（稀疏索引）
+### Step 4: Write `.idx` (Sparse Index)
 
 ```cpp
 void TextIndexSerialization::serializeSparseIndex(...)
 {
-    writeVarUInt(version, ostr);           // 版本号
-    writeVarUInt(num_blocks, ostr);        // dictionary block 数
-    serialize tokens[];                    // 每个 block 的首 token
-    serialize offsets_in_file[];           // 对应 .dct 文件偏移
+    writeVarUInt(version, ostr);           // Version number
+    writeVarUInt(num_blocks, ostr);        // Number of dictionary blocks
+    serialize tokens[];                    // First token of each block
+    serialize offsets_in_file[];           // Corresponding .dct file offsets
 }
 ```
 
-**本例 `.idx` 内容**：
+**Contents of `.idx` in this example**:
 
 ```
 version = 0
 num_blocks = 1
-tokens = ["api"]          ← 第一个 block 的首 token
-offsets = [0]             ← 该 block 在 .dct 中的偏移
+tokens = ["api"]          ← first token of the first block
+offsets = [0]             ← this block's offset in .dct
 ```
 
-查询 `has(tags, 'canary')` 时：
+When querying `has(tags, 'canary')`:
 
-1. 在稀疏索引里二分找到 `api` 所在 block（`canary` ≥ `api` 且 < 下一 block 首 token）。
-2. 按 offset 读整个 dictionary block。
-3. 在 block 内找 `canary` → 读 posting `{3}`。
-4. 知道 granule 内第 3 行命中 → 用于裁剪或 Direct Read。
+1. Use binary search in the sparse index to find the block containing `api` (`canary` ≥ `api` and < the first token of the next block).
+2. Read the entire dictionary block at the offset.
+3. Find `canary` within the block → read posting `{3}`.
+4. Knowing that row 3 within the granule matches enables pruning or Direct Read.
 
 ---
 
-## 6. 完整文件布局示意
+## 6. Complete File-Layout Diagram
 
-### 小 posting 场景（本例：全嵌入 .dct）
+### Small-Posting Scenario (This Example: All Embedded in .dct)
 
 ```mermaid
 flowchart TB
@@ -910,37 +910,37 @@ flowchart TB
     end
 
     subgraph PST["skp_idx_idx_tags.pst"]
-        EMPTY["（本例为空，全嵌入）"]
+        EMPTY["Empty in this example; all postings are embedded"]
     end
 
     IDX -->|"offset=0"| DCT
 ```
 
-### 大 posting 场景（如 `api` 出现 5000 次）
+### Large-Posting Scenario (for Example, `api` Occurs 5,000 Times)
 
 ```mermaid
 flowchart LR
-    DCT2[".dct: api 的 token_info"] -->|"offset=1024<br/>range=[0,3999]"| PST2[".pst block#0<br/>Roaring{0,5,7,...,3999}"]
+    DCT2[".dct: token_info for api"] -->|"offset=1024<br/>range=[0,3999]"| PST2[".pst block#0<br/>Roaring{0,5,7,...,3999}"]
 ```
 
-当 posting 超过 `posting_list_block_size`（默认 1MB 行号范围）时，会切成多个 block，每个 block 在 `.dct` 存 offset + min/max row range。
+When a posting exceeds `posting_list_block_size` (a 1 MB row-number range by default), it is split into multiple blocks. `.dct` stores the offset + min/max row range for each block.
 
 ---
 
-## 7. 可调参数
+## 7. Configurable Parameters
 
-| 参数 | 默认值 | 影响 |
+| Parameter | Default | Effect |
 |------|--------|------|
-| `tokenizer` | 必填 | 如何分词：`array` / `splitByNonAlpha` / `ngrams` / `sparseGrams` / `splitByString` |
-| `preprocessor` | 无 | 写入前先变换列（如 `lower(col)`），不改变 array 维度 |
-| `dictionary_block_size` | 512 | 每个 .dct block 最多多少 token |
-| `dictionary_block_frontcoding_compression` | 1 | token 用 front-coding 压缩（共享前缀） |
-| `posting_list_block_size` | 1048576 (1MB) | 大 posting 按行号范围切 block |
-| `posting_list_codec` | `none` | posting 额外压缩 codec |
-| `GRANULARITY N` | **对 text 无效**（强制 `100000000`） | 用户写的 N 被忽略；整 part 一份倒排 |
-| 表 `index_granularity` | 8192（默认） | 决定 PK mark 大小；查询时按 mark 与 posting 求交裁剪 |
+| `tokenizer` | Required | How to tokenize: `array` / `splitByNonAlpha` / `ngrams` / `sparseGrams` / `splitByString` |
+| `preprocessor` | None | Transform the column before writing (for example, `lower(col)`) without changing the array dimensions |
+| `dictionary_block_size` | 512 | Maximum number of tokens per .dct block |
+| `dictionary_block_frontcoding_compression` | 1 | Compress tokens with front coding (shared prefixes) |
+| `posting_list_block_size` | 1048576 (1MB) | Split large postings into blocks by row-number range |
+| `posting_list_codec` | `none` | Additional posting-compression codec |
+| `GRANULARITY N` | **No effect on text** (forced to `100000000`) | User-specified N is ignored; one inverted index covers the entire part |
+| Table `index_granularity` | 8192 (default) | Determines PK-mark size; queries prune by intersecting each mark with postings |
 
-建表示例：
+Table-creation example:
 
 ```sql
 CREATE TABLE t (
@@ -950,29 +950,29 @@ CREATE TABLE t (
         dictionary_block_size = 512,
         posting_list_block_size = 1048576,
         preprocessor = lower(message)
-    )  -- 可写 GRANULARITY，但对 text 会被强制为 100000000
+    )  -- GRANULARITY may be specified, but for text it is forced to 100000000
 ) ENGINE = MergeTree ORDER BY tuple();
 ```
 
 ---
 
-## 8. 与 minmax / bloom_filter 的对比
+## 8. Comparison with minmax / bloom_filter
 
 | | minmax / bloom_filter | text index |
 |--|----------------------|------------|
-| 粒度 | 每列 min/max 或概率结构 | **每个 token 的倒排 posting list** |
-| 存什么 | 汇总统计 | token 词典 + 行号集合 |
-| 文件数 | 1 个 `.idx` | **3 个** `.idx` + `.dct` + `.pst` |
-| merge | 通常重建 | **可合并**（`MergeTextIndexesTask`） |
-| 查询 | 范围/存在性过滤 | `has()` / `hasAnyTokens()` 等 token 匹配 |
-| Direct Read | 不支持 | 支持（`__text_index_*` 虚拟列） |
+| Granularity | Per-column min/max or probabilistic structure | **Inverted posting list for each token** |
+| Stored data | Aggregate statistics | Token dictionary + sets of row numbers |
+| Number of files | One `.idx` | **Three**: `.idx` + `.dct` + `.pst` |
+| merge | Usually rebuilt | **Mergeable** (`MergeTextIndexesTask`) |
+| Query | Range/existence filtering | Token matching with `has()` / `hasAnyTokens()` and similar functions |
+| Direct Read | Not supported | Supported (`__text_index_*` virtual columns) |
 
 ---
 
-## 9. 验证 SQL
+## 9. Validation SQL
 
 ```sql
--- 建表 + 写入
+-- Create table + insert data
 CREATE DATABASE IF NOT EXISTS text_index_demo;
 USE text_index_demo;
 
@@ -994,7 +994,7 @@ INSERT INTO demo VALUES
 
 OPTIMIZE TABLE demo FINAL;
 
--- 看 part 里索引列占用
+-- Inspect index-column storage in the part
 SELECT
     name,
     column,
@@ -1008,7 +1008,7 @@ WHERE database = currentDatabase()
   AND column LIKE 'skp_idx%'
 ORDER BY column;
 
--- 验证索引裁剪
+-- Verify index pruning
 EXPLAIN indexes = 1
 SELECT count() FROM demo WHERE has(tags, 'api')
 SETTINGS use_skip_indexes_on_data_read = 0;
@@ -1016,17 +1016,17 @@ SETTINGS use_skip_indexes_on_data_read = 0;
 
 ---
 
-## 11. 查询如何用索引定位到 granule
+## 11. How a Query Uses the Index to Locate a Granule
 
-以 `WHERE has(tags, 'api')` 为例，说明从 `.idx → .dct → .pst` 到 **保留/跳过 PK granule（mark）** 的完整路径。
+Using `WHERE has(tags, 'api')` as an example, this section traces the complete path from `.idx → .dct → .pst` to **keeping/skipping a PK granule (mark)**.
 
-### 11.1 前提：text index granule vs PK granule
+### 11.1 Prerequisite: Text-Index Granule vs PK Granule
 
-| 概念 | 含义 |
+| Concept | Meaning |
 |------|------|
-| PK granule / mark | 表 `index_granularity` 划出的数据块（如每 4 行一个 mark） |
-| Text index granule | **整 part 一份倒排**。`INDEX ... GRANULARITY N` 对 text **无效**，解析时强制为 `100000000`（`DEFAULT_TEXT_INDEX_GRANULARITY`） |
-| Posting 行号 | text granule 内行号；因覆盖整 part，等同于 **part 内绝对行号** |
+| PK granule / mark | A data block defined by the table's `index_granularity` (for example, one mark per four rows) |
+| Text index granule | **One inverted index for the entire part**. `INDEX ... GRANULARITY N` has **no effect** on text indexes and is forced to `100000000` during parsing (`DEFAULT_TEXT_INDEX_GRANULARITY`) |
+| Posting row number | A row number within the text granule; because it covers the whole part, this is equivalent to an **absolute row number within the part** |
 
 ```cpp
 // Parsers/ASTIndexDeclaration.cpp
@@ -1035,83 +1035,83 @@ if (type && type->name == "text")
     return ASTIndexDeclaration::DEFAULT_TEXT_INDEX_GRANULARITY;  // 100'000'000
 ```
 
-规划期裁剪（`use_skip_indexes_on_data_read=0`）对 text index 的特殊点（`MergeTreeDataSelectExecutor`）：
+Special handling of text indexes during planning-time pruning (`use_skip_indexes_on_data_read=0`) in `MergeTreeDataSelectExecutor`:
 
-1. **只反序列化一次** text index granule（`reader.read(0, ...)`）——因为整 part 只有这一份
-2. 对每个 **PK mark** 设置 `current_range = [该 mark 起始行, 结束行]`
-3. 用 posting 与 `current_range` 求交，决定是否保留该 mark
+1. Deserialize the text-index granule **only once** (`reader.read(0, ...)`) because the entire part has only one.
+2. For each **PK mark**, set `current_range = [the mark's first row, last row]`.
+3. Intersect the posting with `current_range` to decide whether to keep the mark.
 
-因此下面示例用 `index_granularity = 4` + 8 行数据 → **2 个 PK mark**，共用 **同一份** text 倒排；裁剪粒度是 PK mark，不是 text `GRANULARITY`。
+Therefore, the following example uses `index_granularity = 4` and eight rows of data → **two PK marks** sharing **the same** text inverted index. Pruning occurs at PK-mark granularity, not text `GRANULARITY`.
 
-### 11.2 示例数据（2 个 PK granule）
+### 11.2 Example Data (Two PK Granules)
 
 ```sql
 CREATE TABLE demo (
     id UInt64,
     tags Array(String),
     INDEX idx_tags tags TYPE text(tokenizer = 'array')
-    -- 即使写 GRANULARITY 1 / 2，实际仍是 100000000（整 part 一份）
+    -- Even if GRANULARITY 1 / 2 is specified, the effective value remains 100000000 (one per entire part)
 ) ENGINE = MergeTree
 ORDER BY id
 SETTINGS index_granularity = 4;
 
 INSERT INTO demo VALUES
--- PK mark 0，行 0..3
+-- PK mark 0, rows 0..3
 (0, ['api','web']),
 (1, ['batch']),
 (2, ['api']),
 (3, ['canary']),
--- PK mark 1，行 4..7
+-- PK mark 1, rows 4..7
 (4, ['web']),
 (5, ['api','batch']),
 (6, ['canary']),
 (7, ['web']);
 ```
 
-| PK mark | 行号范围 | 含 `api` 的行 |
+| PK mark | Row-number range | Rows containing `api` |
 |---------|----------|---------------|
 | mark 0 | [0, 3] | 0, 2 |
 | mark 1 | [4, 7] | 5 |
 
-一份 text index granule 覆盖行 0..7，倒排（简化，假设 token 少、全 Embedded）：
+One text-index granule covers rows 0..7. Its inverted index (simplified, assuming few tokens and all Embedded postings) is:
 
-| token | posting（行号） | card |
+| token | posting (row numbers) | card |
 |-------|-----------------|------|
 | `api` | {0, 2, 5} | 3 |
 | `batch` | {1, 5} | 2 |
 | `canary` | {3, 6} | 2 |
 | `web` | {0, 4, 7} | 3 |
 
-`.idx`（假设 `dictionary_block_size` 很大，只有 1 个 dictionary block）：
+`.idx` (assuming `dictionary_block_size` is large enough that there is only one dictionary block):
 
 ```
 sparse: first_token="api", offset_in_dct=0
 ```
 
-### 11.3 总流程
+### 11.3 Overall Flow
 
 ```mermaid
 flowchart TD
-    Q["WHERE has(tags, 'api')"] --> T["Condition 抽出 search token: api"]
-    T --> IDX["读 .idx 稀疏索引"]
-    IDX --> UB["upperBound('api') 定位 dictionary block"]
-    UB --> DCT["seek .dct，反序列化该 block"]
-    DCT --> Find["在 block 内找 token api"]
-    Find --> Info["得到 TokenPostingsInfo<br/>header/card/ranges/offsets 或 embedded body"]
-    Info --> Loop["对每个 PK mark"]
-    Loop --> Range["setCurrentRange mark 的行区间"]
-    Range --> Hit{"posting ∩ range 非空？"}
-    Hit -->|是| Keep["保留该 mark，读数据"]
-    Hit -->|否| Skip["跳过该 mark"]
+    Q["WHERE has(tags, 'api')"] --> T["Condition extracts search token: api"]
+    T --> IDX["Read the .idx sparse index"]
+    IDX --> UB["upperBound('api') locates the dictionary block"]
+    UB --> DCT["Seek in .dct and deserialize the block"]
+    DCT --> Find["Find token api within the block"]
+    Find --> Info["Obtain TokenPostingsInfo<br/>header/card/ranges/offsets or embedded body"]
+    Info --> Loop["For each PK mark"]
+    Loop --> Range["setCurrentRange to the mark's row range"]
+    Range --> Hit{"Is posting ∩ range nonempty?"}
+    Hit -->|yes| Keep["Keep the mark and read data"]
+    Hit -->|no| Skip["Skip the mark"]
 ```
 
 ### 11.4 Step-by-step
 
-#### Step 1：解析查询 → search tokens
+#### Step 1: Parse the Query → Search Tokens
 
-`MergeTreeIndexConditionText` 把 `has(tags, 'api')` 编成 RPN，得到 search token 集合：`{"api"}`。
+`MergeTreeIndexConditionText` encodes `has(tags, 'api')` as RPN and obtains the search-token set `{"api"}`.
 
-#### Step 2：读 `.idx`（稀疏索引）
+#### Step 2: Read `.idx` (Sparse Index)
 
 ```cpp
 // MergeTreeIndexGranuleText::readSparseIndex
@@ -1119,144 +1119,144 @@ sparse_index = deserializeSparseIndex(.idx);
 // tokens = ["api"], offsets_in_file = [0]
 ```
 
-稀疏索引很小，通常整份读入（可走 header cache）。
+The sparse index is small and is usually read in full (possibly through the header cache).
 
-#### Step 3：用稀疏索引定位 `.dct` block
+#### Step 3: Use the Sparse Index to Locate the `.dct` Block
 
 ```cpp
 // analyzeDictionary
-idx = sparse_index->upperBound("api");  // 找到第一个 > "api" 的位置
-if (idx != 0) --idx;                   // 回退到候选 block
+idx = sparse_index->upperBound("api");  // Find the first position > "api"
+if (idx != 0) --idx;                   // Step back to the candidate block
 offset = sparse_index->getOffsetInFile(idx);
 stream.seekToMark({offset, 0});
 block = deserializeDictionaryBlock(.dct);
 ```
 
-本例只有 1 个 block，`idx=0`，seek 到 `.dct` 偏移 0，读出全部 token + 各自的 `TokenPostingsInfo`。
+This example has only one block, so `idx=0`; seek to offset 0 in `.dct` and read all tokens together with their respective `TokenPostingsInfo`.
 
-若有多个 dictionary block（例如首 token 为 `api` / `mmm` / `xxx`）：
+If there are multiple dictionary blocks (for example, with first tokens `api` / `mmm` / `xxx`):
 
 ```
-查 "canary"：
-  upperBound("canary") → 落在 first="api" 与 first="mmm" 之间
-  → 读 block0（api..），在块内找 canary
+Search for "canary":
+  upperBound("canary") → falls between first="api" and first="mmm"
+  → read block0 (api..) and find canary within the block
 ```
 
-#### Step 4：取出 `api` 的 TokenPostingsInfo
+#### Step 4: Retrieve `api`'s TokenPostingsInfo
 
-在 dictionary block 内查找 token：
+Search for the token within the dictionary block:
 
-- 找到 → 放入 `remaining_tokens["api"] = token_info`
-- 找不到且是 `hasAllTokens` → 整 granule 直接判否
+- Found → store it as `remaining_tokens["api"] = token_info`.
+- Not found and the operation is `hasAllTokens` → immediately determine that the entire granule does not match.
 
-本例 Embedded：`token_info` 带 `header=Raw|Embedded`，`card=3`，body `{0,2,5}`；反序列化后还会填：
+In this Embedded example, `token_info` has `header=Raw|Embedded`, `card=3`, and body `{0,2,5}`. Deserialization also populates:
 
 ```
 ranges = [{0, 5}]    // min..max of posting
-offsets = [0]        // embedded 占位；真正 body 已在 info 里
+offsets = [0]        // Embedded placeholder; the actual body is already in info
 ```
 
-若是大 posting（非 Embedded）：`.dct` 只有 `offset → .pst` + `ranges`；需要时再：
+For a large posting (non-Embedded), `.dct` contains only `offset → .pst` + `ranges`; when needed:
 
 ```cpp
-stream.seekToMark({token_info.offsets[block_idx], 0});  // 跳进 .pst
+stream.seekToMark({token_info.offsets[block_idx], 0});  // Jump into .pst
 postings = deserialize(.pst);
 ```
 
-#### Step 5：按 PK mark 用 posting 裁剪
+#### Step 5: Prune with Postings by PK Mark
 
 ```cpp
-// MergeTreeDataSelectExecutor（text index 分支）
+// MergeTreeDataSelectExecutor (text-index branch)
 for (mark = 0; mark < num_marks; ++mark) {
     row_begin = getMarkStartingRow(mark);
     row_end   = getMarkStartingRow(mark + 1);
     granule.setCurrentRange({row_begin, row_end - 1});
     if (condition.mayBeTrueOnGranule(granule))
-        保留 mark;
+        keep the mark;
 }
 ```
 
-`hasAnyQueryTokens` 核心逻辑：
+Core `hasAnyQueryTokens` logic:
 
 ```cpp
-// 1) token 不在 remaining_tokens → 本 mark 无此 token
-// 2) token_info.ranges 与 current_range 无交集 → 跳过（粗筛）
-// 3) 若已加载 posting（Embedded / SingleBlock rare）：
+// 1) token is not in remaining_tokens → this mark does not contain the token
+// 2) token_info.ranges does not intersect current_range → skip (coarse filter)
+// 3) If the posting is loaded (Embedded / SingleBlock rare):
 //      intersection = postings ∩ [row_begin, row_end]
-//      非空 → 保留
+//      Nonempty → keep
 ```
 
-### 11.5 走查两个 mark
+### 11.5 Walking Through the Two Marks
 
-**查询**：`has(tags, 'api')`，posting = `{0, 2, 5}`，`ranges ≈ [0, 5]`
+**Query**: `has(tags, 'api')`, posting = `{0, 2, 5}`, `ranges ≈ [0, 5]`
 
 ```mermaid
 flowchart TB
-    subgraph Mark0["PK mark 0：rows [0, 3]"]
-        R0["range ∩ posting ranges？"]
+    subgraph Mark0["PK mark 0: rows [0, 3]"]
+        R0["range ∩ posting ranges?"]
         R0 --> Y0["[0,3] ∩ [0,5] ≠ ∅"]
         Y0 --> P0["posting ∩ [0,3] = {0,2}"]
-        P0 --> K0["保留 mark 0"]
+        P0 --> K0["Keep mark 0"]
     end
 
-    subgraph Mark1["PK mark 1：rows [4, 7]"]
-        R1["range ∩ posting ranges？"]
+    subgraph Mark1["PK mark 1: rows [4, 7]"]
+        R1["range ∩ posting ranges?"]
         R1 --> Y1["[4,7] ∩ [0,5] ≠ ∅"]
         Y1 --> P1["posting ∩ [4,7] = {5}"]
-        P1 --> K1["保留 mark 1"]
+        P1 --> K1["Keep mark 1"]
     end
 ```
 
-两个 mark 都保留（都含 `api`）。
+Both marks are kept (both contain `api`).
 
 ---
 
-**对比查询**：`has(tags, 'batch')`，posting = `{1, 5}`
+**Comparison query**: `has(tags, 'batch')`, posting = `{1, 5}`
 
-| PK mark | current_range | ranges 粗筛 | posting ∩ range | 结果 |
+| PK mark | current_range | Coarse filtering by ranges | posting ∩ range | Result |
 |---------|---------------|-------------|-----------------|------|
-| mark 0 | [0, 3] | [0,3]∩[1,5]≠∅ | {1} | **保留** |
-| mark 1 | [4, 7] | [4,7]∩[1,5]≠∅ | {5} | **保留** |
+| mark 0 | [0, 3] | [0,3]∩[1,5]≠∅ | {1} | **Keep** |
+| mark 1 | [4, 7] | [4,7]∩[1,5]≠∅ | {5} | **Keep** |
 
 ---
 
-**对比查询**：`has(tags, 'canary')`，posting = `{3, 6}`
+**Comparison query**: `has(tags, 'canary')`, posting = `{3, 6}`
 
-| PK mark | current_range | posting ∩ range | 结果 |
+| PK mark | current_range | posting ∩ range | Result |
 |---------|---------------|-----------------|------|
-| mark 0 | [0, 3] | {3} | **保留** |
-| mark 1 | [4, 7] | {6} | **保留** |
+| mark 0 | [0, 3] | {3} | **Keep** |
+| mark 1 | [4, 7] | {6} | **Keep** |
 
 ---
 
-**再造一个「只命中 mark 1」的例子**：假设数据改成只有行 5 有 `api`，posting = `{5}`，`ranges=[5,5]`：
+**Another example that matches only mark 1**: suppose the data is changed so that only row 5 contains `api`, with posting = `{5}` and `ranges=[5,5]`:
 
-| PK mark | current_range | ranges 粗筛 | posting ∩ range | 结果 |
+| PK mark | current_range | Coarse filtering by ranges | posting ∩ range | Result |
 |---------|---------------|-------------|-----------------|------|
-| mark 0 | [0, 3] | [0,3]∩[5,5]=∅ | — | **跳过**（粗筛即可） |
-| mark 1 | [4, 7] | 相交 | {5} | **保留** |
+| mark 0 | [0, 3] | [0,3]∩[5,5]=∅ | — | **Skip** (the coarse filter is sufficient) |
+| mark 1 | [4, 7] | Intersects | {5} | **Keep** |
 
 ```mermaid
 sequenceDiagram
     participant Q as Query has(tags,'api')
     participant IDX as .idx
     participant DCT as .dct
-    participant PST as .pst（本例 Embedded 不读）
+    participant PST as .pst (not read in this Embedded example)
     participant M0 as PK mark0 [0,3]
     participant M1 as PK mark1 [4,7]
 
-    Q->>IDX: 读稀疏索引
-    IDX->>DCT: seek(offset)，找 token api
+    Q->>IDX: Read the sparse index
+    IDX->>DCT: seek(offset), find token api
     DCT-->>Q: TokenPostingsInfo posting={5}, ranges=[5,5]
     Q->>M0: setCurrentRange[0,3]
-    M0-->>Q: ranges 不相交 → skip
+    M0-->>Q: ranges do not intersect → skip
     Q->>M1: setCurrentRange[4,7]
-    M1-->>Q: posting∩range={5} → keep，读数据
+    M1-->>Q: posting∩range={5} → keep and read data
 ```
 
-### 11.6 多 dictionary block 时的定位（补充）
+### 11.6 Positioning with Multiple Dictionary Blocks (Additional Detail)
 
-假设去重 token 很多，`dictionary_block_size=2`，sorted tokens：`api, batch, canary, web` → 2 个 dct block：
+Suppose there are many distinct tokens, `dictionary_block_size=2`, and the sorted tokens are `api, batch, canary, web` → two dct blocks:
 
 ```
 .idx:
@@ -1264,62 +1264,62 @@ sequenceDiagram
   [1] first="canary", offset→dct_block1   // tokens: canary, web
 ```
 
-查 `web`：
+Searching for `web`:
 
-1. `upperBound("web")` → 指向 block1 之后或 block1
+1. `upperBound("web")` → points to block1 or the position after block1.
 2. `--idx` → block1
-3. 只读 **dct_block1**，不读 block0
-4. 在 block1 找到 `web` → 后续同样按 PK mark 与 posting 求交
+3. Read only **dct_block1**, not block0.
+4. Find `web` in block1 → then intersect the posting with each PK mark as before.
 
 ```mermaid
 flowchart LR
-    IDX[".idx 二分/upperBound"] -->|"block1 offset"| B1[".dct block1<br/>canary, web"]
-    B1 -->|"TokenPostingsInfo"| Filter["按 PK mark 求交裁剪"]
+    IDX[".idx binary search/upperBound"] -->|"block1 offset"| B1[".dct block1<br/>canary, web"]
+    B1 -->|"TokenPostingsInfo"| Filter["Prune by intersecting each PK mark"]
 ```
 
-### 11.7 读时裁剪 vs 规划期裁剪
+### 11.7 Read-Time Pruning vs Planning-Time Pruning
 
-| 模式 | 入口 | 行为 |
+| Mode | Entry Point | Behavior |
 |------|------|------|
-| `use_skip_indexes_on_data_read=0` | `MergeTreeDataSelectExecutor` | 规划期对每个 mark 调 `mayBeTrueOnGranule`，缩小 MarkRanges |
-| `=1`（默认） | `MergeTreeReaderTextIndex::canSkipMark` | 读数据时再判断；可配合 Direct Read 填 `__text_index_*` |
+| `use_skip_indexes_on_data_read=0` | `MergeTreeDataSelectExecutor` | Calls `mayBeTrueOnGranule` for every mark at planning time to reduce MarkRanges |
+| `=1` (default) | `MergeTreeReaderTextIndex::canSkipMark` | Checks while reading data; can populate `__text_index_*` in conjunction with Direct Read |
 
-两者用的索引信息相同：都是 `.idx → .dct → (可选).pst`，再和 mark 的行范围求交。
+Both use the same index information: `.idx → .dct → (optional) .pst`, followed by intersection with the mark's row range.
 
-### 11.8 小结
+### 11.8 Summary
 
-| 步骤 | 用到的文件/结构 | 作用 |
+| Step | File/Structure Used | Purpose |
 |------|-----------------|------|
-| 1 | 查询 AST / Condition | 得到 search tokens |
-| 2 | `.idx` | 用首 token 定位 dictionary block |
-| 3 | `.dct` | 取出 token 的 `TokenPostingsInfo`（小 posting 直接带 body） |
-| 4 | `.pst`（若非 Embedded） | 按 `offsets[i]` seek 读 Roaring/Raw 行号 |
-| 5 | PK mark 的 `[row_begin, row_end]` | 与 posting / ranges 求交 → 保留或跳过该 granule |
+| 1 | Query AST / Condition | Obtain search tokens |
+| 2 | `.idx` | Locate the dictionary block using its first token |
+| 3 | `.dct` | Retrieve the token's `TokenPostingsInfo` (small postings include the body directly) |
+| 4 | `.pst` (if non-Embedded) | Seek by `offsets[i]` and read Roaring/Raw row numbers |
+| 5 | PK mark's `[row_begin, row_end]` | Intersect with posting / ranges → keep or skip the granule |
 
-**一句话**：`.idx` 找到词典块，`.dct` 找到 token 元信息（及小 posting），`.pst` 提供大 posting；最后用 **行号集合 ∩ 每个 PK mark 的行区间** 决定读哪些 granule。
+**In one sentence**: `.idx` locates the dictionary block, `.dct` locates the token metadata (and small posting), and `.pst` provides the large posting; finally, **the row-number set ∩ each PK mark's row range** determines which granules to read.
 
 ---
 
-## 12. 关键源码文件
+## 12. Key Source Files
 
-| 文件 | 职责 |
+| File | Responsibility |
 |------|------|
-| `Storages/MergeTree/MergeTreeIndexText.h` | 格式定义、Granule/Aggregator/Builder |
-| `Storages/MergeTree/MergeTreeIndexText.cpp` | 序列化/反序列化、分词聚合 |
-| `Storages/MergeTree/MergeTreeDataPartWriterOnDisk.cpp` | Part 写入时触发 index 计算 |
-| `Storages/MergeTree/MergeTreeReaderTextIndex.cpp` | 查询时读索引、Direct Read |
-| `Storages/MergeTree/TextIndexUtils.cpp` | Merge 时合并 text index |
-| `Storages/MergeTree/MergeTreeIndicesSerialization.h` | 多 substream 抽象 |
-| `Processors/QueryPlan/Optimizations/optimizeDirectReadFromTextIndex.cpp` | Direct Read 优化 |
+| `Storages/MergeTree/MergeTreeIndexText.h` | Format definitions and Granule/Aggregator/Builder |
+| `Storages/MergeTree/MergeTreeIndexText.cpp` | Serialization/deserialization and tokenization aggregation |
+| `Storages/MergeTree/MergeTreeDataPartWriterOnDisk.cpp` | Triggers index calculation during part writes |
+| `Storages/MergeTree/MergeTreeReaderTextIndex.cpp` | Reads the index during queries; Direct Read |
+| `Storages/MergeTree/TextIndexUtils.cpp` | Merges text indexes during merges |
+| `Storages/MergeTree/MergeTreeIndicesSerialization.h` | Multi-substream abstraction |
+| `Processors/QueryPlan/Optimizations/optimizeDirectReadFromTextIndex.cpp` | Direct Read optimization |
 
 ---
 
-## 13. 一句话总结
+## 13. Summary in One Sentence
 
-Text 索引写入时，对每个 skip index granule 内的行做分词，构建 `token → 行号集合` 的倒排表，然后拆成三层存储：
+When writing a text index, ClickHouse tokenizes the rows in each skip-index granule, builds an inverted `token → set of row numbers` mapping, and splits it into three storage layers:
 
-- **`.idx`**：定位词典块（稀疏索引）
-- **`.dct`**：token 词典 + 小 posting 元数据/内嵌 posting
-- **`.pst`**：大 posting 的 Roaring Bitmap
+- **`.idx`**: locates dictionary blocks (sparse index)
+- **`.dct`**: token dictionary + metadata/embedded data for small postings
+- **`.pst`**: Roaring Bitmaps for large postings
 
-查询时：`.idx` 定位词典块 → `.dct` 取 token 元信息 →（可选）`.pst` 读大 posting → 与每个 PK mark 的行区间求交，跳过不相关 granule；Direct Read 模式下可直接从索引返回匹配行。
+At query time: `.idx` locates the dictionary block → `.dct` retrieves the token metadata → optionally, `.pst` reads the large posting → intersection with each PK mark's row range skips irrelevant granules. In Direct Read mode, matching rows can be returned directly from the index.

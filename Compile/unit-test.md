@@ -1,4 +1,4 @@
-### 如何不开启外部库
+### How to disable external libraries
 
 option(ENABLE_LIBRARIES "Enable all external libraries by default" ON)
 ```
@@ -21,19 +21,19 @@ cmake .. \
   -GNinja
 ```
   
-开启单元测试, 默认开启：
+Enable unit tests (enabled by default):
 ```
 option(ENABLE_TESTS "Provide unit_test_dbms target with Google.Test unit tests" ON)
 ```
 
-### 如何在ClickHouse中运行GTest：
-使用`unit_tests_dbms`, 例如：
+### How to run GoogleTest in ClickHouse
+Use `unit_tests_dbms`. For example:
 ```
-# 默认运行所有的单元测试
+# Run all unit tests by default
 ./unit_tests_dbms 
 ```
 
-运行某个模块的单元测试, 使用`--gtest_filter` + 模块名：
+To run the unit tests for a specific module, use `--gtest_filter` followed by the module name:
 ```
 root@ubantu64:~/work/ClickHouse/build/src# ./unit_tests_dbms  --gtest_filter="T64Test.*"
 Note: Google Test filter = T64Test.*

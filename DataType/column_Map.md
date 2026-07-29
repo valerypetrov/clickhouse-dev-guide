@@ -1,21 +1,21 @@
 <!-- TOC -->
 
-## 一、总体设计思想
-在 ClickHouse 中，Map(K, V) 并不是一个独立的底层存储结构，
-而是通过组合更基础的列类型实现的：
+## 1. Overall Design
+In ClickHouse, `Map(K, V)` is not an independent low-level storage structure.
+It is implemented by composing more fundamental column types:
 ```
 Map(K, V) = Array(Tuple(key, value))
 ```
-即：
-- 每一行的 Map 实际上是一个 数组（Array）；
-- 数组的每个元素是一个 二元组 (key, value)；
-- 整个列在物理上存储为：
-  - 一个 ColumnArray（保存每行数组的中元素个数）
-  - 其内部嵌套的是一个 ColumnTuple，包含：
-    - ColumnVector<KeyType>：所有 key 顺序存储
-    - ColumnVector<ValueType>：所有 value 顺序存储
+Specifically:
+- Each row's map is represented as an `Array`.
+- Each array element is a `(key, value)` tuple.
+- The complete column is physically stored as:
+  - A `ColumnArray`, which records the number of array elements in each row.
+  - A nested `ColumnTuple` containing:
+    - `ColumnVector<KeyType>`: all keys stored sequentially.
+    - `ColumnVector<ValueType>`: all values stored sequentially.
 
-其中，`nested`即为：ColumnArray(ColumnTuple(keys, values))。
+Here, `nested` is `ColumnArray(ColumnTuple(keys, values))`.
 ```
 /** Column, that stores a nested Array(Tuple(key, value)) column.
  */
@@ -27,22 +27,21 @@ private:
     WrappedPtr nested;
 ...
 ```
-示例：
-在内存布局中，它像这样：
+For example, the in-memory layout looks like this:
 ```
 Row1:  [(k1,v1), (k2,v2)]
 Row2:  [(k3,v3)]
 Row3:  [(k4,v4), (k5,v5), (k6,v6)]
 ```
-会被拆成（）：
-| 数据结构        | 内容示例                     |
+It is split into:
+| Data structure        | Example contents                     |
 | ----------- | ------------------------ |
-| `keys` 列    | [k1, k2, k3, k4, k5, k6] |
-| `values` 列  | [v1, v2, v3, v4, v5, v6] |
-| `offsets` 列 | [2, 1, 3]  ← 表示每行元素个数 |
+| `keys` column    | [k1, k2, k3, k4, k5, k6] |
+| `values` column  | [v1, v2, v3, v4, v5, v6] |
+| `offsets` column | [2, 1, 3]  ← Number of elements in each row |
 
-一般来说offsets列在磁盘中存储的列名为`size0`。
-## 二、Map的Wide存储模型测试
+On disk, the `offsets` column is generally stored with the name `size0`.
+## 2. Testing the Wide Storage Model for Map
 ```
 1. CREATE TABLE default.test
 (
@@ -53,7 +52,7 @@ ENGINE = MergeTree
 ORDER BY c1
 SETTINGS index_granularity = 8192
 ```
-2. 写入100W随机数据， key在[k0 - k9]
+2. Insert one million random rows with keys in the range `[k0, k9]`
 ```
 INSERT INTO test
 SELECT
@@ -64,11 +63,11 @@ SELECT
     ) AS c2
 FROM numbers(100000);
 ```
-3. 查看数据存储路径
+3. Inspect the data storage path
 ```
 select table,data_paths from system.tables where table = 'test'
 ```
-4. Part的磁盘布局
+4. On-disk part layout
 ```
 root@ubantu64:~/work/ClickHouse/build/programs/store/9d8/9d8c8586-ca90-4ae1-9e6a-cb1188d33c3a/all_2_2_0# cat count.txt
 1000000
@@ -93,7 +92,7 @@ drwxr-x--- 5 root root    4096 Oct 14 14:50 ../
 -rw-r----- 1 root root     267 Oct 14 14:50 primary.cidx
 -rw-r----- 1 root root      93 Oct 14 14:50 serialization.json
 ```
-- 其中 `columns_substreams.txt`，记录了每个列的信息及其子列
+- The `columns_substreams.txt` file records information about each column and its subcolumns.
 ```
 root@ubantu64:~/work/ClickHouse/build/programs/store/9d8/9d8c8586-ca90-4ae1-9e6a-cb1188d33c3a/all_2_2_0# cat columns_substreams.txt
 columns substreams version: 1
@@ -105,10 +104,10 @@ columns substreams version: 1
         c2%2Ekeys
         c2%2Evalues
 ```
-## 常见问题
-1. 对于每行的重复key，他都会进行存储.
+## Frequently Asked Questions
+1. Duplicate keys within a row are all stored.
 
-1️⃣ 创建测试表
+1️⃣ Create a test table
 ```
 DROP TABLE IF EXISTS test_map_dup;
 
@@ -120,7 +119,7 @@ CREATE TABLE test_map_dup
 ENGINE = MergeTree()
 ORDER BY id;
 ```
-2️⃣ 插入包含重复 key 的数据
+2️⃣ Insert data containing duplicate keys
 ```
 INSERT INTO test_map_dup VALUES
 (1, map('a', 10, 'b', 20, 'a', 30)),
@@ -128,13 +127,13 @@ INSERT INTO test_map_dup VALUES
 (3, map('p', 100)),
 (4, map('q', 1, 'r', 2, 'q', 3));
 ```
-3️⃣ 查询每行的所有 key
+3️⃣ Query all keys in each row
 ```
 SELECT id, mapKeys(m) AS keys
 FROM test_map_dup
 ORDER BY id;
 ```
-结果如下：
+The result is:
 ```
 ubantu64 :) SELECT id, mapKeys(m) AS keys
 FROM test_map_dup
@@ -157,7 +156,7 @@ Query id: 13d94ac8-845c-4238-8d7d-3473f5a2d6e4
 
 4 rows in set. Elapsed: 0.002 sec.
 ```
-2. 查询某个 key 的值（默认取第一个匹配）
+2. Query the value for a key (the first match is returned by default)
 ```
 ubantu64 :) SELECT
     id,
@@ -187,7 +186,7 @@ Query id: 823d516d-ba8f-438d-a587-34d75f4805fd
 
 4 rows in set. Elapsed: 0.002 sec.
 ```
-3. 使用`列名.keys` `列名.values`可以直接查看所有的key和value值
+3. Use `column_name.keys` and `column_name.values` to inspect all key and value entries directly.
 
 ```
 ubantu64 :) SELECT
@@ -223,6 +222,6 @@ Query id: 15f2a030-a27c-4661-a89e-95a4895fdbe4
 10 rows in set. Elapsed: 0.002 sec. Processed 16.38 thousand rows, 557.06 KB (6.90 million rows/s., 234.61 MB/s.)
 Peak memory usage: 1.49 MiB.
 ```
-## 总结
-ClickHouse 的 Map 列并非原生哈希表结构，而是通过 Array(Tuple(key, value)) 实现的逻辑映射。
-ColumnMap在底层无法进行O(1)的访问，但是ClickHouse也实现了一些逻辑映射函数，例如可以直接使用map[key]的方式来访问map的key（底层实现是遍历）。
+## Summary
+A ClickHouse `Map` column is not a native hash-table structure. Instead, it implements a logical mapping using `Array(Tuple(key, value))`.
+`ColumnMap` cannot provide O(1) access internally. ClickHouse does, however, implement logical mapping functions such as `map[key]`; internally, this operation performs a scan.

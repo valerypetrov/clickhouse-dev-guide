@@ -1,6 +1,6 @@
-### 单元测试失败
-例如：https://s3.amazonaws.com/clickhouse-test-reports/PRs/89432/5ebbe964d9e1b3ce6db54a131643bf5965b25e71//unit_tests_msan/job.log
-先全局搜一下Error，然后向上看，找失败日志。看具体是哪个CI的失败项导致的, 例如：
+### Unit test failures
+For example: https://s3.amazonaws.com/clickhouse-test-reports/PRs/89432/5ebbe964d9e1b3ce6db54a131643bf5965b25e71//unit_tests_msan/job.log
+First search globally for `Error`, then read upward to find the failure log. Identify the specific CI failure that caused the job to fail, for example:
 ```
 [2025-11-07 01:05:20] [----------] 1 test from T64Test
 [2025-11-07 01:05:20] [ RUN      ] T64Test.TranscodeRawInput
