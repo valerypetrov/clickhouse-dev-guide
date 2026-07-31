@@ -35,15 +35,15 @@ The translation pipeline is composed of several specialized visitors located in 
 
 ```mermaid
 flowchart TD
-    A[PromQL Query] --> B[Parse to PromQL AST]
+    A["PromQL Query"] --> B["Parse to PromQL AST"]
     B --> C{Translation Node}
     C -->|Selectors| D[fromSelector.cpp]
     C -->|Time Functions| E[fromFunctionTime.cpp]
     C -->|Range Functions| F[applyFunctionOverRange.cpp]
-    D --> G[ClickHouse SQL AST]
+    D --> G["ClickHouse SQL AST"]
     E --> G
     F --> G
-    G --> H[Query Execution Pipeline]
+    G --> H["Query Execution Pipeline"]
 ```
 
 ## 3. Sliding Window Aggregations

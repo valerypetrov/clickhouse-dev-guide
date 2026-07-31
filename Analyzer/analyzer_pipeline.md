@@ -26,16 +26,16 @@ Key node types (found under `src/Analyzer/`) include:
 
 ```mermaid
 graph TD
-    A[SQL String] -->|Parser| B[AST Node: IAST]
+    A["SQL String"] -->|Parser| B["AST Node: IAST"]
     B -->|QueryTreeBuilder| C[SelectQueryNode]
-    C --> D[ExpressionListNode: Projection]
-    D --> E[FunctionNode: plus]
-    E --> F[ColumnNode: a]
-    E --> G[ConstantNode: 1]
-    C --> H[TableNode: default.my_table]
-    C --> I[FunctionNode: equals]
-    I --> J[ColumnNode: b]
-    I --> K[ConstantNode: 'test']
+    C --> D["ExpressionListNode: Projection"]
+    D --> E["FunctionNode: plus"]
+    E --> F["ColumnNode: a"]
+    E --> G["ConstantNode: 1"]
+    C --> H["TableNode: default.my_table"]
+    C --> I["FunctionNode: equals"]
+    I --> J["ColumnNode: b"]
+    I --> K["ConstantNode: 'test'"]
 ```
 
 ## 2. QueryTreePassManager & Optimization Passes
@@ -82,10 +82,10 @@ Steps are defined in `src/Processors/QueryPlan/Steps/`:
 
 ```mermaid
 graph TD
-    A[ReadFromMergeTree: my_table] --> B[FilterStep: b = 'test']
-    B --> C[ExpressionStep: a + 1 AS c]
-    C --> D[AggregatingStep: sum(c)]
-    D --> E[ExpressionStep: Finalize Aggregation]
+    A["ReadFromMergeTree: my_table"] --> B["FilterStep: b = 'test'"]
+    B --> C["ExpressionStep: a + 1 AS c"]
+    C --> D["AggregatingStep: sum(c)"]
+    D --> E["ExpressionStep: Finalize Aggregation"]
 ```
 
 ## 4. Processors Execution Engine
@@ -123,15 +123,15 @@ The `PipelineExecutor` uses a highly optimized thread pool.
 ```mermaid
 graph LR
     subgraph Execution Pipeline
-    P1[SourceProcessor] -- OutputPort --> I1((Chunk))
+    P1[SourceProcessor] -- OutputPort --> I1["Chunk"]
     I1 -- InputPort --> P2[TransformProcessor]
-    P2 -- OutputPort --> I2((Chunk))
+    P2 -- OutputPort --> I2["Chunk"]
     I2 -- InputPort --> P3[SinkProcessor]
     end
     
     subgraph Executor Thread Pool
-    T1[Thread 1: Executing Source]
-    T2[Thread 2: Executing Transform]
+    T1["Thread 1: Executing Source"]
+    T2["Thread 2: Executing Transform"]
     end
 ```
 

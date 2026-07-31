@@ -126,17 +126,17 @@ When a part is dropped (e.g., after a merge or TTL):
 
 ```mermaid
 graph TD
-    ZK[ClickHouse Keeper]
+    ZK["ClickHouse Keeper"]
     
     subgraph "Replica A"
-        LocalA[Local Disk Metadata]
+        LocalA["Local Disk Metadata"]
     end
     
     subgraph "Replica B"
-        LocalB[Local Disk Metadata]
+        LocalB["Local Disk Metadata"]
     end
     
-    S3[(Shared S3 Storage)]
+    S3["Shared S3 Storage"]
 
     LocalA -->|Points to| S3
     LocalB -->|Points to| S3

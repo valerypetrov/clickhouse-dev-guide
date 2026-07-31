@@ -85,14 +85,14 @@ ClickHouse tracks memory usage meticulously. A query cannot be allowed to OOM th
 
 ```mermaid
 graph TD
-    A[Query Execution] -->|Allocates Memory| B(PODArray / HashTable)
+    A["Query Execution"] -->|Allocates Memory| B("PODArray / HashTable")
     B --> C{Allocator}
     C -->|If size > threshold| D[mmap]
     C -->|If size <= threshold| E[malloc/jemalloc]
-    C --> F(MemoryTracker)
+    C --> F["MemoryTracker"]
     F -->|Checks limit| G{Over Limit?}
-    G -->|Yes| H[Throw MEMORY_LIMIT_EXCEEDED]
-    G -->|No| I[Update Thread/Query/Global Stats]
+    G -->|Yes| H["Throw MEMORY_LIMIT_EXCEEDED"]
+    G -->|No| I["Update Thread/Query/Global Stats"]
 ```
 
 ### 2.1 The `Allocator` and `Arena`
