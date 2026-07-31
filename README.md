@@ -14,15 +14,34 @@ A practical collection of English-language notes for understanding, building, te
 - [Run integration tests](Tests/integration_test.md)
 - [Read CI results](CI/How-to-read-CI-result.md)
 
-### MergeTree and storage
+### Core query engine and analyzer (Query Pipeline 2.0)
+
+- [New Analyzer, QueryTreeNode AST, and Processor Execution Graph](Analyzer_analyzer_pipeline.md)
+
+### TimeSeries storage engine and PromQL
+
+- [ENGINE = TimeSeries, PromQL-to-SQL Translation, Welford/Chan Variance & Stale Markers](TimeSeries_timeseries_engine_promql.md)
+
+### MergeTree, Object Storage, and Zero-Copy
 
 - [MergeTree interfaces](merge_tree.md)
 - [MergeTree read path](merge_tree_read.md)
 - [MergeTree read modes](MergeTree/mergetree_read_types.md)
+- [MergeTree Granules, Object Storage (S3/Azure), and Zero-Copy Replication](MergeTree_object_storage_zero_copy.md)
 - [Broken parts](MergeTree/broken_parts.md)
 - [Merge implementation notes](doc_about_merge.md)
 - [Disk abstractions](disks.md)
 - [MinIO setup](minio.md)
+
+### Replication, ClickHouse Keeper, and Parallel Replicas
+
+- [ReplicatedMergeTree Replication Log, Keeper Concurrency & Parallel Replicas](Replication_replicated_mergetree_keeper.md)
+
+### SIMD vectorization, memory architecture, and profiling
+
+- [SIMD Vectorization (AVX2/AVX-512/ARM Neon), Memory Infrastructure (PODArray/Arena) & FlameGraphs](Performance_simd_memory_layout.md)
+- [CPU and memory flame graphs](Profiling/ClickHouse_flameGraph_func.md)
+- [Profiling release builds with perf](Profiling/perf_release.md)
 
 ### Data types, expressions, and functions
 
@@ -38,11 +57,6 @@ A practical collection of English-language notes for understanding, building, te
 - [Hash join internals](Join/hash_join.md)
 - [Text skip index internals](SkipIndex/text_index.md)
 - [`apply_mutations_on_fly` internals](Mutations/apply_mutations_on_fly.md)
-
-### Profiling and client examples
-
-- [CPU and memory flame graphs](Profiling/ClickHouse_flameGraph_func.md)
-- [Profiling release builds with perf](Profiling/perf_release.md)
 - [Python client and concurrent insert example](Annoying-conf/clickhouse_connect.md)
 
 ## Using this guide
