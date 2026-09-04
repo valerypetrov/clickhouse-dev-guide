@@ -105,6 +105,8 @@ Suggested stand-down comment for the PR:
 
 ## 3. What is in this directory and how to use it
 
+The patch below was pushed to the PR branch `valerypetrov/ClickHouse:promql-over-distributed` as commit `a7a3a2501c4a18b8384fc519e93e80354e522cb4` on top of `e1ae54c`, so PR 117170 already carries it; the file is kept here as the record. The stand-down comment in section 2 still has to be posted on the PR by hand.
+
 - `0001-Check-the-local-shard-s-own-grants-before-the-promet.patch`: the fix, on top of `e1ae54c` (`git am` it onto `promql-over-distributed`). Files: `src/Storages/TimeSeries/resolvePrometheusQueryTarget.{cpp,h}`, `docs/concepts/features/interfaces/prometheus.mdx`, `tests/integration/test_prometheus_protocols/test_local_shard_distributed.py`.
 
 ```sh
