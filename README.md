@@ -13,6 +13,7 @@ A practical collection of English-language notes for understanding, building, te
 - [Run unit tests](Compile/unit-test.md)
 - [Run integration tests](Tests/integration_test.md)
 - [Read CI results](CI/How-to-read-CI-result.md)
+- [PR 117170: acting on clickhouse-gh bot findings (fuzzer triage and an access-ordering fix)](PRs/117170/README.md)
 
 ### Core query engine and analyzer (Query Pipeline 2.0)
 
