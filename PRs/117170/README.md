@@ -110,6 +110,10 @@ What was deliberately kept: the per-class grant re-checks (HTTP API constructor,
 
 Verification: the repo's C++ style script and `ruff` pass, `black` passes on the seven PR modules, a clang-format dry run over the changed lines proposes only the pre-existing include order of the handler, the comment audit finds no added block over two lines, and the adversarial reviewer confirmed identical behavior (including that a zero-row block cannot reach the probe loop and that no assertion depends on the sample values the write helper changes).
 
+### Master merged again (TimeSeries versioning)
+
+Master (5cbca3e, Sep 5 20:45 UTC) added schema versioning to the TimeSeries engine with guards at the PromQL and remote-write entry points; four files conflicted because those guards take the TimeSeries table itself while the PR's entry points hold a storage that may be a Distributed wrapper. Resolution (merge `ad5ec290192`): the initiator runs `checkTimeSeriesVersionSupportedByPromQL` / `checkTimeSeriesVersionIsWritable` only when the target is a TimeSeries table (right after `resolvePrometheusQueryTarget` says so); over a wrapper the shards apply them, in the selector each shard runs and in `StorageTimeSeries::write`, which master also guards. One auto-merged call in the table function's read path would have cast the wrapper and thrown, so it is gated on the target's cluster name. The two files the PR had switched to the generic storage header include `StorageTimeSeries.h` again for the cast idiom master uses.
+
 ## 2. The AST fuzzer failure is not this PR's
 
 What the bot links: `Not-ready Set is passed as the second argument for function 'A (STID: 0250-4e52)` → issue #117806. That link is by normalized message only (the STID replaces every identifier with `A`, so every `Not-ready Set` error shares it). Issue #117806 was an object-storage `_path GLOBAL IN` query, closed as a duplicate fixed by PR #112968 (merged Sep 3, after this branch's last merge of master on Sep 2). The failure on this PR is a different shape:
