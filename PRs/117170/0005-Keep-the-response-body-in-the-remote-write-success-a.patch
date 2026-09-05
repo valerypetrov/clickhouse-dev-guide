@@ -1,0 +1,46 @@
+From 5fd7193e17586d963efd58219bf3697969b14a59 Mon Sep 17 00:00:00 2001
+From: Valery Petrov <valerypetrov@icloud.com>
+Date: Sat, 5 Sep 2026 11:47:22 +0000
+Subject: [PATCH] Keep the response body in the remote-write success assertions
+
+The helper the write tests share returns the response; assert on it in
+a variable so a failed 204 still shows what the server said, as the
+checked sender did before.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016i1XnLC3KypZdaYYsfzqub
+---
+ .../test_write_distributed.py                          | 10 ++++------
+ 1 file changed, 4 insertions(+), 6 deletions(-)
+
+diff --git a/tests/integration/test_prometheus_protocols/test_write_distributed.py b/tests/integration/test_prometheus_protocols/test_write_distributed.py
+index 19ac2a0ea39..a6b514b884f 100644
+--- a/tests/integration/test_prometheus_protocols/test_write_distributed.py
++++ b/tests/integration/test_prometheus_protocols/test_write_distributed.py
+@@ -115,8 +115,8 @@ def test_remote_write_rejects_a_mismatching_time_series_type():
+ 
+ 
+ def test_remote_write_over_distributed():
+-    assert write("/dist/write", "dist_metric", HOSTS).status_code == 204
+-
++    response = write("/dist/write", "dist_metric", HOSTS)
++    assert response.status_code == 204, response.text
+     # Every sample lands exactly once across the shards, and the fixed hash split fills both.
+     assert_eq_with_retry(
+         node,
+@@ -147,10 +147,8 @@ def test_remote_write_over_distributed_ignores_async_insert():
+             "SELECT sum(value) FROM system.events WHERE event = 'AsyncInsertQuery'"
+         )
+     )
+-    assert (
+-        write("/dist/write?async_insert=1", "async_dist_metric", HOSTS).status_code
+-        == 204
+-    )
++    response = write("/dist/write?async_insert=1", "async_dist_metric", HOSTS)
++    assert response.status_code == 204, response.text
+ 
+     # The samples are on the shards, and no asynchronous insert ran: the batch never waited in
+     # the queue for a busy timeout before reaching them.
+-- 
+2.43.0
+
