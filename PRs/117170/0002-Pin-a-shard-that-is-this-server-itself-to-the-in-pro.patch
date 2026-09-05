@@ -1,4 +1,4 @@
-From 5242f1a9922c0c56c9d6f7721300a74b093c00c6 Mon Sep 17 00:00:00 2001
+From 61ff7cc614b16b99d23084ae678e765210adbb7a Mon Sep 17 00:00:00 2001
 From: Valery Petrov <valerypetrov@icloud.com>
 Date: Sat, 5 Sep 2026 03:12:02 +0000
 Subject: [PATCH] Pin a shard that is this server itself to the in-process path
@@ -27,9 +27,10 @@ Claude-Session: https://claude.ai/code/session_016i1XnLC3KypZdaYYsfzqub
  .../PrometheusQueryToSQL/fromSelector.cpp     |  3 ++
  .../PrometheusRemoteWriteProtocol.cpp         |  2 +
  .../resolvePrometheusQueryTarget.cpp          |  9 ++--
+ .../TimeSeries/resolvePrometheusQueryTarget.h |  7 +--
  .../configs/config.d/local_shard_dist.xml     | 13 ++++++
  .../test_local_shard_distributed.py           | 44 ++++++++++++++++++-
- 6 files changed, 64 insertions(+), 9 deletions(-)
+ 7 files changed, 66 insertions(+), 14 deletions(-)
 
 diff --git a/docs/concepts/features/interfaces/prometheus.mdx b/docs/concepts/features/interfaces/prometheus.mdx
 index c41ee1816..5d63bb00f 100644
@@ -112,6 +113,24 @@ index 8eccc23fa..85b8dc45e 100644
                      && replica_index < shards_addresses[shard_index].size() && shards_addresses[shard_index][replica_index].is_local;
                  RemoteQueryExecutor probe(pool, make_probe_query(runs_on_the_caller), probe_header, probe_context);
                  bool answered = false;
+diff --git a/src/Storages/TimeSeries/resolvePrometheusQueryTarget.h b/src/Storages/TimeSeries/resolvePrometheusQueryTarget.h
+index 27b6f4798..06d1b128b 100644
+--- a/src/Storages/TimeSeries/resolvePrometheusQueryTarget.h
++++ b/src/Storages/TimeSeries/resolvePrometheusQueryTarget.h
+@@ -31,11 +31,8 @@ bool prometheusQueryReadsTimeSeries(const PrometheusQueryTree & promql_query);
+ void checkNoBypassedReadRestriction(
+     const StorageID & storage_id, const ContextPtr & context, std::string_view operation, std::string_view rewrite);
+ 
+-/// The wrapper's SELECT grant (table functions are exempt from the planner's check), then what a plain SELECT through
+-/// it would apply and the rewrite cannot (its row policy, filters keyed to it; the shard-local table's are checked by
+-/// the selector on each shard), then READ ON REMOTE, which the generated cluster() call would enforce only later,
+-/// then, for a shard that is this server itself, the selector's own SELECT and CREATE TEMPORARY TABLE, then every
+-/// replica's shard-local target: a TimeSeries table declaring the wrapper's `time_series` type, or the read is refused.
++/// SELECT on the wrapper, no row policy or filter the rewrite would skip, READ ON REMOTE and a local shard's own grants,
++/// all before the probe; then every replica's target must be a TimeSeries table of the wrapper's `time_series` type.
+ void checkPrometheusQueryDistributedRead(const IStorage & storage, const ContextPtr & context);
+ 
+ /// The same targets for a write, refused while any replica is unreachable, has no such table or does not show its
 diff --git a/tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml b/tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml
 index c7a5def9b..83aa81ab7 100644
 --- a/tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml
