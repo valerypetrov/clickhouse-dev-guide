@@ -76,7 +76,7 @@ The bot's next review accepted the grant pre-check but blocked on consistency: t
 
 The reviewer offered two fixes: share the exact "local plan under the caller's context" predicate, or disable those modes for the generated read. The second is a few lines and removes the disagreement instead of tracking it, so that is what the follow-up commit does:
 
-- The generated `cluster()` read carries `SETTINGS prefer_localhost_replica = 1, enable_parallel_replicas = 0` next to the `serialize_query_plan = 0` the PR already pins there. A SELECT's own `SETTINGS` clause is applied to that query node's context by the query tree builder, which is the context the planner hands to `StorageDistributed::read`, so `SelectStreamFactory` and `ClusterProxy::executeQuery` see the pinned values.
+- Both read executors (the HTTP endpoints and the `prometheusQuery` table functions) pin `prefer_localhost_replica = 1` and `enable_parallel_replicas = 0` with `Context::setSetting` on the context that executes the generated SQL, next to the `enable_materialized_cte` they already force. A first draft put them in the generated `SETTINGS` clause instead; a verifier showed that a nested clause is clamped against the caller's settings constraints and silently dropped by a read-only constraint, whereas `setSetting`, which the write path already uses, bypasses constraints. Context copies carry the pinned values down to the view's inner query, so `SelectStreamFactory` and `ClusterProxy::executeQuery` see them.
 - The remote-write context pins `prefer_localhost_replica = 1` next to the delivery settings it already forces, so the sink writes a local shard in-process too.
 - The probe treats a local replica as the caller's own context unconditionally (`runs_on_the_caller = address.is_local`), and the `Setting::prefer_localhost_replica` extern goes away.
 - Docs: one parenthetical in the sentence that already stated the in-process semantics for a local shard.
@@ -126,7 +126,7 @@ Suggested stand-down comment for the PR:
 Both patches below were pushed to the PR branch `valerypetrov/ClickHouse:promql-over-distributed` (first `a7a3a2501`, then the round-2 follow-up), so PR 117170 already carries them; the files are kept here as the record. The stand-down comment in section 2 still has to be posted on the PR by hand.
 
 - `0001-Check-the-local-shard-s-own-grants-before-the-promet.patch`: the grant pre-check, on top of `e1ae54c`. Files: `src/Storages/TimeSeries/resolvePrometheusQueryTarget.{cpp,h}`, `docs/concepts/features/interfaces/prometheus.mdx`, `tests/integration/test_prometheus_protocols/test_local_shard_distributed.py`.
-- `0002-Pin-a-shard-that-is-this-server-itself-to-the-in-pro.patch`: the round-2 pin, on top of the first. Files: `src/Storages/TimeSeries/PrometheusQueryToSQL/fromSelector.cpp`, `src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp`, `src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp`, the docs, `tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml` and the test module.
+- `0002-Pin-a-shard-that-is-this-server-itself-to-the-in-pro.patch`: the round-2 pin, on top of the first. Files: `src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp`, `src/Storages/StoragePrometheusQuery.cpp`, `src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp`, `src/Storages/TimeSeries/resolvePrometheusQueryTarget.{cpp,h}`, the docs, `tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml` and the test module.
 
 ```sh
 git checkout promql-over-distributed

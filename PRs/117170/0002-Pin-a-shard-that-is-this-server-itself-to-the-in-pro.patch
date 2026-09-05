@@ -1,4 +1,4 @@
-From 61ff7cc614b16b99d23084ae678e765210adbb7a Mon Sep 17 00:00:00 2001
+From 6ea7b59c03b15769cc796bdb698f4d617bcba278 Mon Sep 17 00:00:00 2001
 From: Valery Petrov <valerypetrov@icloud.com>
 Date: Sat, 5 Sep 2026 03:12:02 +0000
 Subject: [PATCH] Pin a shard that is this server itself to the in-process path
@@ -12,25 +12,27 @@ task-based parallel replicas off; a caller setting them the other way
 had the probe validate one table while the shard read another, and the
 grant pre-check ask for grants the connection path never needs.
 
-Pin both on the generated cluster() read and on the write's context, as
-the write already pins its delivery settings, so the three places agree
-whatever the caller brings. The probe treats a local replica as this
-context unconditionally. The tests read a wrapper over a one-replica
-and a two-replica local shard with prefer_localhost_replica off and with
-parallel replicas on, and expect the caller's own database either way,
-with the grant refusal still first.
+Pin both on the context that executes the generated read, on the query
+endpoints and the table functions alike, and prefer_localhost_replica on
+the write's context next to the delivery settings it already pins, so
+the three places agree whatever the caller brings. The probe treats a
+local replica as this context unconditionally. The tests read a wrapper
+over a one-replica and a two-replica local shard with
+prefer_localhost_replica off and with parallel replicas on, and expect
+the caller's own database either way, with the grant refusal still first.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016i1XnLC3KypZdaYYsfzqub
 ---
  .../features/interfaces/prometheus.mdx        |  2 +-
- .../PrometheusQueryToSQL/fromSelector.cpp     |  3 ++
+ src/Storages/StoragePrometheusQuery.cpp       | 11 +++--
+ .../TimeSeries/PrometheusHTTPProtocolAPI.cpp  |  7 +++
  .../PrometheusRemoteWriteProtocol.cpp         |  2 +
  .../resolvePrometheusQueryTarget.cpp          |  9 ++--
  .../TimeSeries/resolvePrometheusQueryTarget.h |  7 +--
  .../configs/config.d/local_shard_dist.xml     | 13 ++++++
  .../test_local_shard_distributed.py           | 44 ++++++++++++++++++-
- 7 files changed, 66 insertions(+), 14 deletions(-)
+ 8 files changed, 77 insertions(+), 18 deletions(-)
 
 diff --git a/docs/concepts/features/interfaces/prometheus.mdx b/docs/concepts/features/interfaces/prometheus.mdx
 index c41ee1816..5d63bb00f 100644
@@ -45,20 +47,48 @@ index c41ee1816..5d63bb00f 100644
  
  Remote write into a `Distributed` target is an `INSERT` through that table's sink with [`distributed_foreground_insert`](/reference/settings/session-settings/distributed#distributed_foreground_insert) forced on and [`async_insert`](/reference/settings/session-settings/async-insert#async_insert) forced off, whatever the handler's user profile or the `remote_write` URL says: the samples are not queued on the initiator, by the sink or by the asynchronous insert queue, but delivered to the shards before the response, so a `204` means every shard (one replica per shard under `internal_replication`) has accepted them, and a shard that fails the insert fails the write with a retryable `5xx`, which Prometheus answers by resending the batch. A batch left in either queue would be flushed after the check above, into whatever answers to the shard-local name by then, which is why background delivery is not offered on this path. [`skip_unavailable_shards`](/reference/settings/session-settings/skip-unavailable-shards#skip_unavailable_shards) is forced off on this path too, whatever the URL or the profile says: a shard the sink skipped would be samples dropped under a `204`. The routing settings `insert_shard_id` and `insert_distributed_one_random_shard` are refused on this path, whether they come from the URL or from the profile: a batch goes where the table's sharding key sends it, so a `Distributed` table with several shards and no key cannot be written through remote write.
  
-diff --git a/src/Storages/TimeSeries/PrometheusQueryToSQL/fromSelector.cpp b/src/Storages/TimeSeries/PrometheusQueryToSQL/fromSelector.cpp
-index 900b57359..a6cf1d9aa 100644
---- a/src/Storages/TimeSeries/PrometheusQueryToSQL/fromSelector.cpp
-+++ b/src/Storages/TimeSeries/PrometheusQueryToSQL/fromSelector.cpp
-@@ -67,6 +67,9 @@ namespace
-         /// Always ship the query text: a serialized plan binds an unqualified name on the
-         /// initiator, and shards do not apply their own row policies to a shipped plan (#112891).
-         cluster_builder.settings_changes.emplace_back("serialize_query_plan", false);
-+        /// A shard that is this server itself is always read in-process, as the shard-target check assumes.
-+        cluster_builder.settings_changes.emplace_back("prefer_localhost_replica", true);
-+        cluster_builder.settings_changes.emplace_back("enable_parallel_replicas", false);
+diff --git a/src/Storages/StoragePrometheusQuery.cpp b/src/Storages/StoragePrometheusQuery.cpp
+index 375cd448b..7cf50c921 100644
+--- a/src/Storages/StoragePrometheusQuery.cpp
++++ b/src/Storages/StoragePrometheusQuery.cpp
+@@ -222,12 +222,15 @@ void StoragePrometheusQuery::readImpl(
+     /// The generated SQL relies on `AS MATERIALIZED` to avoid evaluating subqueries referenced more than once
+     /// repeatedly (see SQLSubqueryType::MATERIALIZED_TABLE), and that mark has effect only with the setting
+     /// `enable_materialized_cte` enabled. Enable it unless the user set it explicitly.
+-    auto query_context = context;
++    auto query_context = Context::createCopy(context);
+     if (!context->getSettingsRef()[Setting::enable_materialized_cte].changed)
++        query_context->setSetting("enable_materialized_cte", true);
++
++    /// A shard that is this server itself is always read in-process, as the shard-target check assumes.
++    if (!config.evaluation_settings.cluster_name.empty())
+     {
+-        auto context_copy = Context::createCopy(context);
+-        context_copy->setSetting("enable_materialized_cte", true);
+-        query_context = context_copy;
++        query_context->setSetting("prefer_localhost_replica", true);
++        query_context->setSetting("enable_parallel_replicas", false);
+     }
  
-         /// SELECT timeSeriesTagsToGroup(tags) AS group, timestamp, value FROM view(<cluster query>)
-         /// Groups are node-local: without the view() the whole query goes to the shards, which each restart their own counter.
+     InterpreterSelectQueryAnalyzer interpreter(select_query, query_context, options, column_names);
+diff --git a/src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp b/src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp
+index 0ac1ec829..8bb05e99c 100644
+--- a/src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp
++++ b/src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp
+@@ -291,6 +291,13 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
+     /// `AS MATERIALIZED` is honored by the analyzer only, so the generated SQL always runs the analyzer.
+     getContext()->setSetting("allow_experimental_analyzer", true);
+ 
++    /// A shard that is this server itself is always read in-process, as the shard-target check assumes.
++    if (is_distributed_target)
++    {
++        getContext()->setSetting("prefer_localhost_replica", true);
++        getContext()->setSetting("enable_parallel_replicas", false);
++    }
++
+     auto [ast, io] = executeQuery(sql_query->formatWithSecretsOneLine(), getContext(), {}, QueryProcessingStage::Complete);
+ 
+     try
 diff --git a/src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp b/src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp
 index 3ca4f0b05..a42fa3103 100644
 --- a/src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp
