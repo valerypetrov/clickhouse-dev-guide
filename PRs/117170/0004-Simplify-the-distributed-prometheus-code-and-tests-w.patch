@@ -1,0 +1,886 @@
+From 3000468a3777fad7175060d1e10dfc6071279f77 Mon Sep 17 00:00:00 2001
+From: Valery Petrov <valerypetrov@icloud.com>
+Date: Sat, 5 Sep 2026 11:29:05 +0000
+Subject: [PATCH] Simplify the distributed prometheus code and tests without
+ changing behavior
+
+Fold the wrapper's declared shard-skip settings into the resolved target
+instead of a second accessor and two std::tie sites; probe the replicas
+by zipping shards with their addresses rather than indexing with a guard
+no reachable cluster needs; use the cluster's local shard count for the
+local-shard pre-check; drop an empty-block check the executor never
+returns; write hasInstantSelector as one expression; give the handler one
+helper for "grant before existence, then the table"; test the target by
+its cluster name where the sibling path already does.
+
+Tests share error_code, keyed_result and the instant/range endpoint
+switch through prometheus_test_utils, the write tests build their batch
+through one helper, and every comment and docstring the branch added is
+at most two lines. Coverage is unchanged.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016i1XnLC3KypZdaYYsfzqub
+---
+ .../features/interfaces/prometheus.mdx        |  2 +-
+ src/Server/PrometheusRequestHandler.cpp       | 23 +++--
+ src/Storages/StoragePrometheusQuery.cpp       |  4 +-
+ .../TimeSeries/PrometheusHTTPProtocolAPI.cpp  | 10 +--
+ .../resolvePrometheusQueryTarget.cpp          | 41 +++------
+ .../TimeSeries/resolvePrometheusQueryTarget.h | 12 ++-
+ .../TableFunctionTimeSeries.cpp               |  8 +-
+ .../configs/config.d/local_shard_dist.xml     |  5 +-
+ .../prometheus_test_utils.py                  | 42 ++++++++++
+ .../test_access_distributed.py                | 45 ++++------
+ .../test_local_shard_distributed.py           | 27 ++----
+ .../test_query_distributed.py                 | 33 ++++----
+ .../test_refusals_distributed.py              | 28 +++----
+ .../test_row_policy_distributed.py            | 20 +----
+ .../test_skipped_shard_distributed.py         |  6 +-
+ .../test_write_distributed.py                 | 83 ++++++-------------
+ .../05055_promql_over_distributed.sql         |  3 +-
+ 17 files changed, 169 insertions(+), 223 deletions(-)
+
+diff --git a/docs/concepts/features/interfaces/prometheus.mdx b/docs/concepts/features/interfaces/prometheus.mdx
+index 5d63bb00f67..2f15c1f8a9b 100644
+--- a/docs/concepts/features/interfaces/prometheus.mdx
++++ b/docs/concepts/features/interfaces/prometheus.mdx
+@@ -86,7 +86,7 @@ ClickHouse implements the Prometheus HTTP API over a [`TimeSeries`](/reference/e
+ 
+ The query endpoints, remote write, and the `prometheusQuery`/`prometheusQueryRange` table functions also accept a `Distributed` table over per-shard `TimeSeries` tables: samples are selected on every shard and the PromQL is evaluated on the initiator, and writes are routed through the `Distributed` sink. Remote read and the metadata endpoints (`/api/v1/series`, `/api/v1/labels`, `/api/v1/label/<name>/values`, `/api/v1/metadata`) remain `TimeSeries`-only and refuse a `Distributed` target.
+ 
+-Every shard-local table behind such a `Distributed` table must be a `TimeSeries` table declaring the same `time_series` type as the `Distributed` table itself; a mismatch is refused rather than rounded, and the check asks every replica of every shard on every request, so a shard-local table swapped for another under the same name is caught by the next request rather than written into. A read is not failed by a replica the check cannot reach or that has no table of that name: whether the read itself fails is decided, as before, by its own `skip_unavailable_shards` settings. Remote write, however, is refused (with a retryable `5xx`) while any replica is unreachable, has no table of that name, or does not show that table's `time_series` type, because a replica the check could not see would still receive the samples unchecked. When the `Distributed` table declares no database, each shard resolves the name in its own default database, except a shard that is this server itself, which is always read and written in-process (`prefer_localhost_replica` is pinned on and parallel replicas off for these paths) and so resolves it in the requesting user's current database, exactly as any query here would. Reading through it needs `SELECT` on the `Distributed` table and `READ ON REMOTE`, because the query is rewritten into a `cluster()` call; both are checked before the shard-local check above runs, so a caller without either is refused with a plain access error rather than told what the shards hold. The `prometheusQuery`/`prometheusQueryRange` table functions need `CREATE TEMPORARY TABLE` on top of those, as they do over a `TimeSeries` table; the query endpoints name the selector inside the `cluster()` call for each shard to resolve, so they need it only for a shard that is this server itself, together with `SELECT` on that shard's table; both are checked before the shard-local check runs too. Writing needs `INSERT` on the `Distributed` table only.
++Every shard-local table behind such a `Distributed` table must be a `TimeSeries` table declaring the same `time_series` type as the `Distributed` table itself; a mismatch is refused rather than rounded, and the check asks every replica of every shard on every request, so a shard-local table swapped for another under the same name is caught by the next request rather than written into. A read is not failed by a replica the check cannot reach or that has no table of that name: whether the read itself fails is decided, as before, by its own `skip_unavailable_shards` settings. Remote write, however, is refused (with a retryable `5xx`) while any replica is unreachable, has no table of that name, or does not show that table's `time_series` type, because a replica the check could not see would still receive the samples unchecked. When the `Distributed` table declares no database, each shard resolves the name in its own default database, except a shard that is this server itself, which is always read and written in-process (`prefer_localhost_replica` is pinned on for both, and parallel replicas off for the reads) and so resolves it in the requesting user's current database, exactly as any query here would. Reading through it needs `SELECT` on the `Distributed` table and `READ ON REMOTE`, because the query is rewritten into a `cluster()` call; both are checked before the shard-local check above runs, so a caller without either is refused with a plain access error rather than told what the shards hold. The `prometheusQuery`/`prometheusQueryRange` table functions need `CREATE TEMPORARY TABLE` on top of those, as they do over a `TimeSeries` table; the query endpoints name the selector inside the `cluster()` call for each shard to resolve, so they need it only for a shard that is this server itself, together with `SELECT` on that shard's table; both are checked before the shard-local check runs too. Writing needs `INSERT` on the `Distributed` table only.
+ 
+ Remote write into a `Distributed` target is an `INSERT` through that table's sink with [`distributed_foreground_insert`](/reference/settings/session-settings/distributed#distributed_foreground_insert) forced on and [`async_insert`](/reference/settings/session-settings/async-insert#async_insert) forced off, whatever the handler's user profile or the `remote_write` URL says: the samples are not queued on the initiator, by the sink or by the asynchronous insert queue, but delivered to the shards before the response, so a `204` means every shard (one replica per shard under `internal_replication`) has accepted them, and a shard that fails the insert fails the write with a retryable `5xx`, which Prometheus answers by resending the batch. A batch left in either queue would be flushed after the check above, into whatever answers to the shard-local name by then, which is why background delivery is not offered on this path. [`skip_unavailable_shards`](/reference/settings/session-settings/skip-unavailable-shards#skip_unavailable_shards) is forced off on this path too, whatever the URL or the profile says: a shard the sink skipped would be samples dropped under a `204`. The routing settings `insert_shard_id` and `insert_distributed_one_random_shard` are refused on this path, whether they come from the URL or from the profile: a batch goes where the table's sharding key sends it, so a `Distributed` table with several shards and no key cannot be written through remote write.
+ 
+diff --git a/src/Server/PrometheusRequestHandler.cpp b/src/Server/PrometheusRequestHandler.cpp
+index 59751b6d6bf..e66d031b1da 100644
+--- a/src/Server/PrometheusRequestHandler.cpp
++++ b/src/Server/PrometheusRequestHandler.cpp
+@@ -275,6 +275,14 @@ protected:
+         return StorageID{full_name};
+     }
+ 
++    /// Grant before existence: a caller without the right must not learn whether the name exists.
++    StoragePtr getTimeSeriesTable(const AccessFlags & required_access)
++    {
++        auto table_id = getTimeSeriesTableID();
++        context->checkAccess(required_access, table_id);
++        return DatabaseCatalog::instance().getTable(table_id, context);
++    }
++
+     void onException() override
+     {
+         // So that the next requests on the connection have to always start afresh in case of exceptions.
+@@ -322,10 +330,7 @@ public:
+             throw Exception(ErrorCodes::UNSUPPORTED_MEDIA_TYPE,
+                 "HTTP header Content-Encoding has unsupported value '{}' (must be 'snappy' or 'zstd')", content_encoding);
+ 
+-        auto table_id = getTimeSeriesTableID();
+-        /// Grant before existence: a probe without the right must not learn whether the name exists.
+-        context->checkAccess(AccessType::INSERT, table_id);
+-        auto table = DatabaseCatalog::instance().getTable(table_id, context);
++        auto table = getTimeSeriesTable(AccessType::INSERT);
+         PrometheusRemoteWriteProtocol protocol{table, context};
+ 
+         prometheus::WriteRequest write_request;
+@@ -367,10 +372,7 @@ public:
+         checkHTTPHeader(request, "Content-Type", "application/x-protobuf");
+         checkHTTPHeader(request, "Content-Encoding", "snappy");
+ 
+-        auto table_id = getTimeSeriesTableID();
+-        /// Grant before existence, as on the write path.
+-        context->checkAccess(AccessType::SELECT, table_id);
+-        auto table = DatabaseCatalog::instance().getTable(table_id, context);
++        auto table = getTimeSeriesTable(AccessType::SELECT);
+         PrometheusRemoteReadProtocol protocol{table, context};
+ 
+         prometheus::ReadRequest read_request;
+@@ -498,10 +500,7 @@ public:
+                 return;
+             }
+ 
+-            auto table_id = getTimeSeriesTableID();
+-            /// Grant before existence, as on the protocol paths.
+-            context->checkAccess(AccessType::SELECT, table_id);
+-            auto table = DatabaseCatalog::instance().getTable(table_id, context);
++            auto table = getTimeSeriesTable(AccessType::SELECT);
+             PrometheusHTTPProtocolAPI protocol{table, context};
+ 
+             auto query_finish_callback = [&]()
+diff --git a/src/Storages/StoragePrometheusQuery.cpp b/src/Storages/StoragePrometheusQuery.cpp
+index 887b09df68b..d91e6bd70ef 100644
+--- a/src/Storages/StoragePrometheusQuery.cpp
++++ b/src/Storages/StoragePrometheusQuery.cpp
+@@ -168,8 +168,8 @@ StoragePrometheusQuery::Configuration StoragePrometheusQuery::getConfiguration(A
+     {
+         evaluation_settings.cluster_name = std::move(distributed_target->cluster_name);
+         evaluation_settings.remote_time_series_storage_id = std::move(distributed_target->remote_time_series_storage_id);
+-        std::tie(evaluation_settings.skip_unavailable_shards, evaluation_settings.skip_unavailable_shards_mode)
+-            = declaredShardSkipSettings(*time_series_storage);
++        evaluation_settings.skip_unavailable_shards = distributed_target->skip_unavailable_shards;
++        evaluation_settings.skip_unavailable_shards_mode = std::move(distributed_target->skip_unavailable_shards_mode);
+     }
+     evaluation_settings.timestamp_data_type = std::move(timestamp_data_type);
+     evaluation_settings.scalar_data_type = std::move(scalar_data_type);
+diff --git a/src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp b/src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp
+index 049a0e43243..eb934edf6c0 100644
+--- a/src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp
++++ b/src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp
+@@ -223,14 +223,12 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
+ {
+     PrometheusQueryEvaluationSettings evaluation_settings;
+     evaluation_settings.time_series_storage_id = time_series_storage->getStorageID();
+-    bool is_distributed_target = false;
+     if (auto distributed_target = resolvePrometheusQueryTarget(*time_series_storage))
+     {
+-        is_distributed_target = true;
+         evaluation_settings.cluster_name = std::move(distributed_target->cluster_name);
+         evaluation_settings.remote_time_series_storage_id = std::move(distributed_target->remote_time_series_storage_id);
+-        std::tie(evaluation_settings.skip_unavailable_shards, evaluation_settings.skip_unavailable_shards_mode)
+-            = declaredShardSkipSettings(*time_series_storage);
++        evaluation_settings.skip_unavailable_shards = distributed_target->skip_unavailable_shards;
++        evaluation_settings.skip_unavailable_shards_mode = std::move(distributed_target->skip_unavailable_shards_mode);
+     }
+ 
+     /// A Distributed table created `AS <TimeSeries table>` declares the same `time_series` column,
+@@ -250,7 +248,7 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
+     auto query_tree = std::make_shared<PrometheusQueryTree>();
+     query_tree->parse(params.promql_query, timestamp_scale);
+     /// Applied only when the query actually reads the table, as on the table-function path.
+-    if (is_distributed_target && prometheusQueryReadsTimeSeries(*query_tree))
++    if (!evaluation_settings.cluster_name.empty() && prometheusQueryReadsTimeSeries(*query_tree))
+         checkPrometheusQueryDistributedRead(*time_series_storage, getContext());
+     LOG_TRACE(log, "Parsed PromQL query: {}. Result type: {}", params.promql_query, query_tree->getResultType());
+ 
+@@ -292,7 +290,7 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
+     query_context->setSetting("empty_result_for_aggregation_by_empty_set", false);
+ 
+     /// A shard that is this server itself is always read in-process, as the shard-target check assumes.
+-    if (is_distributed_target)
++    if (!evaluation_settings.cluster_name.empty())
+     {
+         query_context->setSetting("prefer_localhost_replica", true);
+         query_context->setSetting("enable_parallel_replicas", false);
+diff --git a/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp b/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp
+index 94854919f19..fb23f41b221 100644
+--- a/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp
++++ b/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp
+@@ -29,6 +29,7 @@
+ #include <fmt/ranges.h>
+ 
+ #include <algorithm>
++#include <ranges>
+ #include <set>
+ 
+ 
+@@ -88,6 +89,10 @@ std::optional<PrometheusQueryDistributedTarget> resolvePrometheusQueryTarget(con
+ 
+     target.remote_time_series_storage_id.database_name = distributed->getRemoteDatabaseName();
+     target.remote_time_series_storage_id.table_name = distributed->getRemoteTableName();
++    /// Restated on the generated cluster() call as its own declaration, so ClusterProxy applies its usual precedence.
++    const auto & declared = distributed->getDistributedSettingsRef();
++    target.skip_unavailable_shards = declared[DistributedSetting::skip_unavailable_shards].value;
++    target.skip_unavailable_shards_mode = declared[DistributedSetting::skip_unavailable_shards_mode].toString();
+     return target;
+ }
+ 
+@@ -95,14 +100,8 @@ namespace
+ {
+ bool hasInstantSelector(const PrometheusQueryTree::Node * node)
+ {
+-    if (!node)
+-        return false;
+-    if (node->node_type == PrometheusQueryTree::NodeType::InstantSelector)
+-        return true;
+-    for (const auto * child : node->children)
+-        if (hasInstantSelector(child))
+-            return true;
+-    return false;
++    return node
++        && (node->node_type == PrometheusQueryTree::NodeType::InstantSelector || std::ranges::any_of(node->children, hasInstantSelector));
+ }
+ }
+ 
+@@ -166,23 +165,15 @@ namespace
+         std::set<String> wrong_types;
+         /// Unreachable, or without the table: the sink cannot use them either, and what answers to the name later is unchecked.
+         Strings unavailable_replicas;
+-        const auto & shards_info = cluster->getShardsInfo();
+-        const auto & shards_addresses = cluster->getShardsAddresses();
+-        for (size_t shard_index = 0; shard_index != shards_info.size(); ++shard_index)
+-            for (size_t replica_index = 0; replica_index != shards_info[shard_index].per_replica_pools.size(); ++replica_index)
++        for (const auto [shard_info, shard_addresses] : std::views::zip(cluster->getShardsInfo(), cluster->getShardsAddresses()))
++            for (const auto [pool, address] : std::views::zip(shard_info.per_replica_pools, shard_addresses))
+             {
+-                const auto & pool = shards_info[shard_index].per_replica_pools[replica_index];
+-                /// A cluster assembled from a subset of another carries no addresses: treat those as remote.
+-                const bool runs_on_the_caller = shard_index < shards_addresses.size()
+-                    && replica_index < shards_addresses[shard_index].size() && shards_addresses[shard_index][replica_index].is_local;
+-                RemoteQueryExecutor probe(pool, make_probe_query(runs_on_the_caller), probe_header, probe_context);
++                RemoteQueryExecutor probe(pool, make_probe_query(address.is_local), probe_header, probe_context);
+                 bool answered = false;
+                 try
+                 {
+                     for (Block block = probe.readBlock(); !block.empty(); block = probe.readBlock())
+                     {
+-                        if (!block.rows())
+-                            continue;
+                         block = convertBLOBColumns(block);
+                         answered = true;
+                         const Field engine = (*block.getByPosition(0).column)[0];
+@@ -284,8 +275,7 @@ void checkPrometheusQueryDistributedRead(const IStorage & storage, const Context
+ 
+     /// The read pins prefer_localhost_replica on and parallel replicas off, so a shard that is this server itself
+     /// runs in-process on the caller's context: the selector's own grants are asked for here, before the probe.
+-    const auto cluster = typeid_cast<const StorageDistributed &>(storage).getCluster();
+-    if (std::ranges::any_of(cluster->getShardsInfo(), &Cluster::ShardInfo::isLocal))
++    if (typeid_cast<const StorageDistributed &>(storage).getCluster()->getLocalShardCount())
+     {
+         context->checkAccess(AccessType::SELECT, context->resolveStorageID(target->remote_time_series_storage_id));
+         context->checkAccess(AccessType::CREATE_TEMPORARY_TABLE);
+@@ -313,13 +303,4 @@ void checkPrometheusQueryDistributedWrite(const IStorage & storage, const Contex
+     checkShardTargets(storage, *target, context, /* refuse_unavailable = */ true);
+ }
+ 
+-std::pair<bool, String> declaredShardSkipSettings(const IStorage & storage)
+-{
+-    /// Handed to the generated cluster() call as its own declaration, so ClusterProxy applies the
+-    /// query-overrides-declaration rule itself rather than this file restating it.
+-    const auto & declared = typeid_cast<const StorageDistributed &>(storage).getDistributedSettingsRef();
+-    return {declared[DistributedSetting::skip_unavailable_shards].value,
+-            declared[DistributedSetting::skip_unavailable_shards_mode].toString()};
+-}
+-
+ }
+diff --git a/src/Storages/TimeSeries/resolvePrometheusQueryTarget.h b/src/Storages/TimeSeries/resolvePrometheusQueryTarget.h
+index 06d1b128b78..29d4066952b 100644
+--- a/src/Storages/TimeSeries/resolvePrometheusQueryTarget.h
++++ b/src/Storages/TimeSeries/resolvePrometheusQueryTarget.h
+@@ -17,6 +17,9 @@ struct PrometheusQueryDistributedTarget
+ {
+     String cluster_name;
+     StorageID remote_time_series_storage_id = StorageID::createEmpty();
++    /// The wrapper's declared shard-skip settings, restated on the generated cluster() call.
++    bool skip_unavailable_shards = false;
++    String skip_unavailable_shards_mode;
+ };
+ 
+ /// Checks that a table can be used as a target of a prometheus query, i.e. that it's either a TimeSeries table
+@@ -35,13 +38,8 @@ void checkNoBypassedReadRestriction(
+ /// all before the probe; then every replica's target must be a TimeSeries table of the wrapper's `time_series` type.
+ void checkPrometheusQueryDistributedRead(const IStorage & storage, const ContextPtr & context);
+ 
+-/// The same targets for a write, refused while any replica is unreachable, has no such table or does not show its
+-/// `time_series` type (it would take samples unchecked), and under insert_shard_id / insert_distributed_one_random_shard:
+-/// the key alone routes a batch.
++/// The same probe for a write, which also refuses an unreachable replica or a missing table or type (it would take
++/// samples unchecked) and insert_shard_id / insert_distributed_one_random_shard: the sharding key alone routes a batch.
+ void checkPrometheusQueryDistributedWrite(const IStorage & storage, const ContextPtr & context);
+ 
+-/// The wrapper's declared {skip_unavailable_shards, skip_unavailable_shards_mode}, restated as the
+-/// generated cluster() call's own declaration so ClusterProxy applies its usual precedence.
+-std::pair<bool, String> declaredShardSkipSettings(const IStorage & storage);
+-
+ }
+diff --git a/src/TableFunctions/TableFunctionTimeSeries.cpp b/src/TableFunctions/TableFunctionTimeSeries.cpp
+index 2495b4a4bc2..ae83968e545 100644
+--- a/src/TableFunctions/TableFunctionTimeSeries.cpp
++++ b/src/TableFunctions/TableFunctionTimeSeries.cpp
+@@ -238,8 +238,8 @@ prometheusQuery('time_series_table', 'promql_query', evaluation_time)
+ 
+ ## Arguments {#arguments}
+ 
+-- `db_name` - The name of the database where a TimeSeries table is located.
+-- `time_series_table` - The name of a TimeSeries table.
++- `db_name` - The name of the database where the table is located.
++- `time_series_table` - The name of a TimeSeries table, or of a Distributed table over per-shard TimeSeries tables.
+ - `promql_query` - A query written in [PromQL syntax](https://prometheus.io/docs/prometheus/latest/querying/basics/).
+ - `evaluation_time - The evaluation timestamp. To evaluate a query at the current time, use `now()` as `evaluation_time`.
+ 
+@@ -311,8 +311,8 @@ prometheusQueryRange('time_series_table', 'promql_query', start_time, end_time,
+ 
+ ## Arguments {#arguments}
+ 
+-- `db_name` - The name of the database where a TimeSeries table is located.
+-- `time_series_table` - The name of a TimeSeries table.
++- `db_name` - The name of the database where the table is located.
++- `time_series_table` - The name of a TimeSeries table, or of a Distributed table over per-shard TimeSeries tables.
+ - `promql_query` - A query written in [PromQL syntax](https://prometheus.io/docs/prometheus/latest/querying/basics/).
+ - `start_time` - The start time of the evaluation range.
+ - `end_time` - The end time of the evaluation range.
+diff --git a/tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml b/tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml
+index 83aa81ab7c2..1662cb97d35 100644
+--- a/tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml
++++ b/tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml
+@@ -1,8 +1,7 @@
+ <clickhouse>
+     <remote_servers>
+-        <!-- One shard, and no <default_database> on it: the entry is local on this node
+-             (Cluster::Address::is_local), so the sink and the read rewrite run it in-process
+-             on the caller's context instead of over the connection. -->
++        <!-- One shard, no <default_database>: local on this node (Cluster::Address::is_local), so the sink and
++             the read rewrite run it in-process on the caller's context instead of over the connection. -->
+         <local_shard_dist>
+             <shard>
+                 <replica>
+diff --git a/tests/integration/test_prometheus_protocols/prometheus_test_utils.py b/tests/integration/test_prometheus_protocols/prometheus_test_utils.py
+index a48e0906cc9..41dec5d25ba 100644
+--- a/tests/integration/test_prometheus_protocols/prometheus_test_utils.py
++++ b/tests/integration/test_prometheus_protocols/prometheus_test_utils.py
+@@ -429,3 +429,45 @@ def value_close_to(value1, value2, eps):
+         return math.isinf(value2) and (value1 > 0) == (value2 > 0)
+     else:
+         return math.isnan(value2)
++
++
++def error_code(node, name):
++    """The numeric code of a ClickHouse error, looked up on the server: no test names a magic number."""
++    return node.query(
++        f"SELECT DISTINCT code FROM system.errors WHERE name = '{name}'",
++        settings={"system_events_show_zero_values": 1},
++    ).strip()
++
++
++def keyed_result(data):
++    """Keys the series of a result by their labels: an instant result comes back in no defined
++    order, so both answers are keyed before they are compared."""
++    keyed = {
++        tuple(sorted(series["metric"].items())): (
++            series["value"] if "value" in series else series["values"]
++        )
++        for series in data["result"]
++    }
++    assert len(keyed) == len(data["result"]), f"Duplicate label sets in {data}"
++    return data["resultType"], keyed
++
++
++def get_error_from_query_endpoint(
++    host, port, prefix, endpoint, query, start, end, step, params=None
++):
++    """The error of the instant ("query", evaluated at `end`) or the range endpoint under `prefix`."""
++    if endpoint == "query":
++        return execute_query_via_http_api(
++            host, port, f"{prefix}/query", query, end, params=params, expect_error=True
++        )
++    return execute_range_query_via_http_api(
++        host,
++        port,
++        f"{prefix}/query_range",
++        query,
++        start,
++        end,
++        step,
++        params=params,
++        expect_error=True,
++    )
+diff --git a/tests/integration/test_prometheus_protocols/test_access_distributed.py b/tests/integration/test_prometheus_protocols/test_access_distributed.py
+index a5bed8d5fcc..cc36ab969af 100644
+--- a/tests/integration/test_prometheus_protocols/test_access_distributed.py
++++ b/tests/integration/test_prometheus_protocols/test_access_distributed.py
+@@ -1,6 +1,6 @@
+-"""Every Prometheus surface of a Distributed target checks its grant (SELECT to read, INSERT
+-to write) before it looks at the table, so a denied caller learns nothing else. A read is
+-denied for the grants the rewrite needs later too, before the shard probe speaks."""
++"""A denied caller learns only that it lacks a grant: every surface checks SELECT or INSERT before it
++looks at the table, and a read checks the grants the rewrite needs later before the shard probe speaks.
++"""
+ 
+ import json
+ 
+@@ -13,8 +13,9 @@ from helpers.test_tools import assert_eq_with_retry
+ from .prometheus_test_utils import (
+     convert_read_request_to_protobuf,
+     convert_time_series_to_protobuf,
++    error_code,
+     execute_query_via_http_api,
+-    execute_range_query_via_http_api,
++    get_error_from_query_endpoint,
+     get_response_to_remote_read,
+     get_response_to_remote_write,
+     send_protobuf_to_remote_write,
+@@ -114,15 +115,6 @@ def start_cluster():
+         cluster.shutdown()
+ 
+ 
+-def error_code(name):
+-    """The numeric code of a ClickHouse error, looked up on the server so that no test below
+-    has to name a magic number of its own."""
+-    return node.query(
+-        f"SELECT DISTINCT code FROM system.errors WHERE name = '{name}'",
+-        settings={"system_events_show_zero_values": 1},
+-    ).strip()
+-
+-
+ def as_user(user):
+     return {} if user is None else {"user": user, "password": ""}
+ 
+@@ -148,27 +140,16 @@ def query(handler, user=None, table=None, expect_error=False):
+ 
+ def coarse_query(endpoint, user=None):
+     """The error of the instant or range PromQL endpoint over the wrapper the probe rejects."""
+-    params = as_user(user)
+-    if endpoint == "query":
+-        return execute_query_via_http_api(
+-            node.ip_address,
+-            9093,
+-            f"{COARSE}/query",
+-            "m",
+-            EVALUATION_TIME,
+-            params=params,
+-            expect_error=True,
+-        )
+-    return execute_range_query_via_http_api(
++    return get_error_from_query_endpoint(
+         node.ip_address,
+         9093,
+-        f"{COARSE}/query_range",
++        COARSE,
++        endpoint,
+         "m",
+         0,
+         EVALUATION_TIME,
+         "10",
+-        params=params,
+-        expect_error=True,
++        as_user(user),
+     )
+ 
+ 
+@@ -227,7 +208,9 @@ def test_remote_read_needs_the_select_grant():
+         f"{DIST}/read{credentials_in_url(NO_SELECT_USER)}",
+         read_request,
+     )
+-    assert denied.headers["X-ClickHouse-Exception-Code"] == error_code("ACCESS_DENIED")
++    assert denied.headers["X-ClickHouse-Exception-Code"] == error_code(
++        node, "ACCESS_DENIED"
++    )
+     assert denied.status_code == requests.codes.forbidden, denied.text
+     assert "NOT_IMPLEMENTED" not in denied.text
+     assert "Distributed" not in denied.text
+@@ -242,7 +225,9 @@ def test_remote_write_needs_the_insert_grant():
+             [({"__name__": "denied_metric", "host": "h0"}, {EVALUATION_TIME: 1.0})]
+         ),
+     )
+-    assert denied.headers["X-ClickHouse-Exception-Code"] == error_code("ACCESS_DENIED")
++    assert denied.headers["X-ClickHouse-Exception-Code"] == error_code(
++        node, "ACCESS_DENIED"
++    )
+     assert denied.status_code == requests.codes.forbidden, denied.text
+ 
+     # A write the same handler does accept, so the count below is read only after the sink has
+diff --git a/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py b/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py
+index b99f2f7edc8..c40b6ca04f4 100644
+--- a/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py
++++ b/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py
+@@ -1,7 +1,6 @@
+-"""A cluster entry with no <default_database> is local on this node, so the sink writes it and
+-the read rewrite reads it in-process on the caller's context - which resolves an undeclared
+-shard-local database to the caller's current one, not to the probe connection's. The probe has
+-to ask each replica about the table that replica will actually be given."""
++"""A cluster entry without <default_database> is local, so the sink and the read rewrite run it in-process
++on the caller's context, where an undeclared database is the caller's own: the probe must check that table.
++"""
+ 
+ import json
+ 
+@@ -13,7 +12,7 @@ from helpers.test_tools import assert_eq_with_retry
+ from .prometheus_test_utils import (
+     convert_time_series_to_protobuf,
+     execute_query_via_http_api,
+-    execute_range_query_via_http_api,
++    get_error_from_query_endpoint,
+     get_response_to_remote_write,
+     send_protobuf_to_remote_write,
+ )
+@@ -154,26 +153,16 @@ def test_remote_write_is_refused_when_only_the_probes_database_is_healthy():
+ def query_as(endpoint, user, settings=None):
+     """The error of the instant or range PromQL endpoint for a caller of this name."""
+     params = {"user": user, "password": "", **(settings or {})}
+-    if endpoint == "query":
+-        return execute_query_via_http_api(
+-            node.ip_address,
+-            9093,
+-            "/local_api/query",
+-            "local_metric",
+-            START_TIME,
+-            params=params,
+-            expect_error=True,
+-        )
+-    return execute_range_query_via_http_api(
++    return get_error_from_query_endpoint(
+         node.ip_address,
+         9093,
+-        "/local_api/query_range",
++        "/local_api",
++        endpoint,
+         "local_metric",
+         START_TIME,
+         START_TIME + 10,
+         "10",
+-        params=params,
+-        expect_error=True,
++        params,
+     )
+ 
+ 
+diff --git a/tests/integration/test_prometheus_protocols/test_query_distributed.py b/tests/integration/test_prometheus_protocols/test_query_distributed.py
+index 191186f95f9..c0c21a979bf 100644
+--- a/tests/integration/test_prometheus_protocols/test_query_distributed.py
++++ b/tests/integration/test_prometheus_protocols/test_query_distributed.py
+@@ -10,6 +10,7 @@ from helpers.cluster import ClickHouseCluster
+ from .prometheus_test_utils import (
+     execute_query_via_http_api,
+     execute_range_query_via_http_api,
++    keyed_result,
+ )
+ 
+ cluster = ClickHouseCluster(__file__)
+@@ -76,32 +77,28 @@ def start_cluster():
+         cluster.shutdown()
+ 
+ 
+-def keyed_result(data_json):
+-    """Keys the series of a query result by their labels: only range queries come back
+-    ordered by tags, so an instant result is keyed before the answers are compared."""
+-    data = json.loads(data_json)
+-    keyed = {
+-        tuple(sorted(series["metric"].items())): (
+-            series["value"] if "value" in series else series["values"]
+-        )
+-        for series in data["result"]
+-    }
+-    assert len(keyed) == len(data["result"]), f"Duplicate label sets in {data_json}"
+-    return data["resultType"], keyed
+-
+-
+ def query(handler, promql):
+     return keyed_result(
+-        execute_query_via_http_api(
+-            node.ip_address, 9093, f"{handler}/query", promql, EVALUATION_TIME
++        json.loads(
++            execute_query_via_http_api(
++                node.ip_address, 9093, f"{handler}/query", promql, EVALUATION_TIME
++            )
+         )
+     )
+ 
+ 
+ def range_query(handler, promql, start, end, step):
+     return keyed_result(
+-        execute_range_query_via_http_api(
+-            node.ip_address, 9093, f"{handler}/query_range", promql, start, end, step
++        json.loads(
++            execute_range_query_via_http_api(
++                node.ip_address,
++                9093,
++                f"{handler}/query_range",
++                promql,
++                start,
++                end,
++                step,
++            )
+         )
+     )
+ 
+diff --git a/tests/integration/test_prometheus_protocols/test_refusals_distributed.py b/tests/integration/test_prometheus_protocols/test_refusals_distributed.py
+index 5e7273a2cdc..387b4180d60 100644
+--- a/tests/integration/test_prometheus_protocols/test_refusals_distributed.py
++++ b/tests/integration/test_prometheus_protocols/test_refusals_distributed.py
+@@ -1,6 +1,6 @@
+-"""Surfaces that cannot merge shards - the inner-table readers /api/v1/series, /labels,
+-/label/<name>/values, /metadata and remote read with its node-local counter - each refuse a
+-Distributed target."""
++"""The inner-table readers (/api/v1/series, /labels, /label/<name>/values, /metadata) and remote read
++with its node-local counter cannot merge shards, so each refuses a Distributed target.
++"""
+ 
+ import json
+ 
+@@ -13,6 +13,7 @@ from helpers.test_tools import assert_eq_with_retry
+ from .prometheus_test_utils import (
+     convert_metrics_metadata_to_protobuf,
+     convert_read_request_to_protobuf,
++    error_code,
+     execute_query_via_http_api,
+     execute_range_query_via_http_api,
+     get_response_to_remote_read,
+@@ -91,15 +92,6 @@ def start_cluster():
+         cluster.shutdown()
+ 
+ 
+-def error_code(name):
+-    """The numeric code of a ClickHouse error, looked up on the server so that no test below
+-    has to name a magic number of its own."""
+-    return node.query(
+-        f"SELECT DISTINCT code FROM system.errors WHERE name = '{name}'",
+-        settings={"system_events_show_zero_values": 1},
+-    ).strip()
+-
+-
+ def get_answer(path):
+     """The answer of an endpoint over the local TimeSeries table."""
+     response = requests.get(f"http://{node.ip_address}:9093{path}")
+@@ -163,7 +155,9 @@ def test_remote_read_refuses_a_distributed_target():
+         node.ip_address, 9093, f"{DIST}/read", read_request
+     )
+     # Remote read reports the error code itself, so this pins the code and not its wording.
+-    assert response.headers["X-ClickHouse-Exception-Code"] == error_code("NOT_IMPLEMENTED")
++    assert response.headers["X-ClickHouse-Exception-Code"] == error_code(
++        node, "NOT_IMPLEMENTED"
++    )
+     assert response.status_code == requests.codes.not_implemented, response.text
+     assert "NOT_IMPLEMENTED" in response.text
+ 
+@@ -180,7 +174,13 @@ def test_the_query_endpoints_still_answer_over_a_distributed_target():
+ 
+     ranged = json.loads(
+         execute_range_query_via_http_api(
+-            node.ip_address, 9093, f"{DIST}/query_range", "m", 100, EVALUATION_TIME, "20"
++            node.ip_address,
++            9093,
++            f"{DIST}/query_range",
++            "m",
++            100,
++            EVALUATION_TIME,
++            "20",
+         )
+     )
+     assert len(ranged["result"]) == 4, ranged
+diff --git a/tests/integration/test_prometheus_protocols/test_row_policy_distributed.py b/tests/integration/test_prometheus_protocols/test_row_policy_distributed.py
+index dbbd3aa3a42..3d74f22a88e 100644
+--- a/tests/integration/test_prometheus_protocols/test_row_policy_distributed.py
++++ b/tests/integration/test_prometheus_protocols/test_row_policy_distributed.py
+@@ -1,6 +1,5 @@
+-"""A row policy or an additional_table_filters entry that a plain SELECT applies and PromQL would not refuses
+-the PromQL read: on the Distributed table, on a single TimeSeries table, and, checked on the shard, on a
+-shard-local table. The metadata endpoints refuse a single table under either the same way.
++"""A row policy or additional_table_filters entry that a plain SELECT applies and PromQL would not refuses
++the PromQL read (wrapper, single table, shard-local table) and the metadata endpoints on a single table.
+ """
+ 
+ import contextlib
+@@ -10,7 +9,7 @@ import requests
+ 
+ from helpers.cluster import ClickHouseCluster
+ 
+-from .prometheus_test_utils import get_response_to_http_api_query
++from .prometheus_test_utils import get_response_to_http_api_query, keyed_result
+ 
+ cluster = ClickHouseCluster(__file__)
+ 
+@@ -168,17 +167,6 @@ def assert_refused(response, *fragments):
+         assert fragment in body["error"], body["error"]
+ 
+ 
+-def keyed_result(data):
+-    """Keys the series of a query result by their labels: an instant result comes back in no
+-    defined order, so it has to be keyed before two answers can be compared."""
+-    keyed = {
+-        tuple(sorted(series["metric"].items())): series["value"]
+-        for series in data["result"]
+-    }
+-    assert len(keyed) == len(data["result"]), f"Duplicate label sets in {data}"
+-    return data["resultType"], keyed
+-
+-
+ def query(handler, promql, user=None):
+     response = query_response(handler, promql, user)
+     assert response.status_code == 200, response.text
+@@ -299,7 +287,7 @@ def test_metadata_endpoints_fail_closed_under_additional_table_filters(
+             node.query("SELECT count() FROM ts_all", user="prom_filter_short").strip()
+             == "0"
+         )
+-        for user in ("prom_filter_short", "prom_filter_full"):
++        for user in WRAPPER_FILTER_USERS:
+             assert_refused(
+                 metadata_response(endpoint, params, user),
+                 f"The Prometheus {endpoint_name} endpoint is not supported on table",
+diff --git a/tests/integration/test_prometheus_protocols/test_skipped_shard_distributed.py b/tests/integration/test_prometheus_protocols/test_skipped_shard_distributed.py
+index 587e70f9960..7c5631cc4e3 100644
+--- a/tests/integration/test_prometheus_protocols/test_skipped_shard_distributed.py
++++ b/tests/integration/test_prometheus_protocols/test_skipped_shard_distributed.py
+@@ -1,6 +1,6 @@
+-"""The shard-target check asks every replica afresh on every request, so a table swapped under the name is
+-caught by the next one; a replica it cannot reach, or without its table, passes a read and refuses a write,
+-not queued."""
++"""The shard-target check runs afresh on every request, so a table swapped under the name is caught by the
++next one; a replica it cannot reach, or without its table, passes a read but refuses a write, never queued.
++"""
+ 
+ import json
+ 
+diff --git a/tests/integration/test_prometheus_protocols/test_write_distributed.py b/tests/integration/test_prometheus_protocols/test_write_distributed.py
+index 81625ee6379..19ac2a0ea39 100644
+--- a/tests/integration/test_prometheus_protocols/test_write_distributed.py
++++ b/tests/integration/test_prometheus_protocols/test_write_distributed.py
+@@ -7,7 +7,6 @@ from .prometheus_test_utils import (
+     convert_time_series_to_protobuf,
+     execute_query_via_http_api,
+     get_response_to_remote_write,
+-    send_protobuf_to_remote_write,
+ )
+ 
+ cluster = ClickHouseCluster(__file__)
+@@ -68,8 +67,20 @@ def start_cluster():
+         cluster.shutdown()
+ 
+ 
+-def count_on_the_shards(wrapper, metric_name):
+-    node.query(f"SYSTEM FLUSH DISTRIBUTED {wrapper}")
++def write(path, metric_name, hosts=("h0",)):
++    """One sample per host, staggered so the samples of a batch stay distinct."""
++    time_series = [
++        ({"__name__": metric_name, "host": host}, {START_TIME + i: float(i)})
++        for i, host in enumerate(hosts)
++    ]
++    return get_response_to_remote_write(
++        node.ip_address, 9093, path, convert_time_series_to_protobuf(time_series)
++    )
++
++
++def count_on_the_shards(wrapper, metric_name, flush=True):
++    if flush:
++        node.query(f"SYSTEM FLUSH DISTRIBUTED {wrapper}")
+     return int(
+         node.query(
+             f"SELECT (SELECT count() FROM timeSeriesTags(shard_0.ts_local) WHERE metric_name = '{metric_name}')"
+@@ -81,9 +92,7 @@ def count_on_the_shards(wrapper, metric_name):
+ def test_remote_write_rejects_non_timeseries_shards():
+     """The wrapper declares no remote database, so each shard resolves `mt_bad` in its own default
+     database - the case the initiator cannot answer with its own `currentDatabase()`."""
+-    time_series = [({"__name__": "bad_metric", "host": "h0"}, {START_TIME: 1.0})]
+-    protobuf = convert_time_series_to_protobuf(time_series)
+-    response = get_response_to_remote_write(node.ip_address, 9093, "/bad/write", protobuf)
++    response = write("/bad/write", "bad_metric")
+     assert response.status_code >= 400
+     assert "UNEXPECTED_TABLE_ENGINE" in response.text
+     # Nothing was written anywhere, on either shard.
+@@ -96,9 +105,7 @@ def test_remote_write_rejects_non_timeseries_shards():
+ 
+ 
+ def test_remote_write_rejects_a_mismatching_time_series_type():
+-    time_series = [({"__name__": "coarse_metric", "host": "h0"}, {START_TIME: 1.0})]
+-    protobuf = convert_time_series_to_protobuf(time_series)
+-    response = get_response_to_remote_write(node.ip_address, 9093, "/coarse/write", protobuf)
++    response = write("/coarse/write", "coarse_metric")
+     assert response.status_code >= 400
+     assert "TYPE_MISMATCH" in response.text
+     # The refusal names both types, and nothing was written to either shard.
+@@ -108,12 +115,7 @@ def test_remote_write_rejects_a_mismatching_time_series_type():
+ 
+ 
+ def test_remote_write_over_distributed():
+-    time_series = [
+-        ({"__name__": "dist_metric", "host": host}, {START_TIME + i: float(i)})
+-        for i, host in enumerate(HOSTS)
+-    ]
+-    protobuf = convert_time_series_to_protobuf(time_series)
+-    send_protobuf_to_remote_write(node.ip_address, 9093, "/dist/write", protobuf)
++    assert write("/dist/write", "dist_metric", HOSTS).status_code == 204
+ 
+     # Every sample lands exactly once across the shards, and the fixed hash split fills both.
+     assert_eq_with_retry(
+@@ -145,23 +147,14 @@ def test_remote_write_over_distributed_ignores_async_insert():
+             "SELECT sum(value) FROM system.events WHERE event = 'AsyncInsertQuery'"
+         )
+     )
+-    time_series = [
+-        ({"__name__": "async_dist_metric", "host": host}, {START_TIME: 1.0})
+-        for host in HOSTS
+-    ]
+-    protobuf = convert_time_series_to_protobuf(time_series)
+-    send_protobuf_to_remote_write(
+-        node.ip_address, 9093, "/dist/write?async_insert=1", protobuf
++    assert (
++        write("/dist/write?async_insert=1", "async_dist_metric", HOSTS).status_code
++        == 204
+     )
+ 
+     # The samples are on the shards, and no asynchronous insert ran: the batch never waited in
+     # the queue for a busy timeout before reaching them.
+-    on_the_shards = int(
+-        node.query(
+-            "SELECT (SELECT count() FROM timeSeriesTags(shard_0.ts_local) WHERE metric_name = 'async_dist_metric')"
+-            " + (SELECT count() FROM timeSeriesTags(shard_1.ts_local) WHERE metric_name = 'async_dist_metric')"
+-        )
+-    )
++    on_the_shards = count_on_the_shards("prom_dist", "async_dist_metric", flush=False)
+     assert on_the_shards == len(HOSTS)
+     assert (
+         int(
+@@ -176,14 +169,7 @@ def test_remote_write_over_distributed_ignores_async_insert():
+ def test_remote_write_refuses_insert_shard_id():
+     """A plain INSERT with insert_shard_id = 1 sends the batch to shard 1 whatever the key says; the
+     endpoint refuses it instead, so a 204 always means the wrapper's own placement."""
+-    time_series = [
+-        ({"__name__": "pinned_metric", "host": host}, {START_TIME + i: float(i)})
+-        for i, host in enumerate(HOSTS)
+-    ]
+-    protobuf = convert_time_series_to_protobuf(time_series)
+-    response = get_response_to_remote_write(
+-        node.ip_address, 9093, "/dist/write?insert_shard_id=1", protobuf
+-    )
++    response = write("/dist/write?insert_shard_id=1", "pinned_metric", HOSTS)
+     assert response.status_code == 400
+     assert "BAD_ARGUMENTS" in response.text
+     assert "does not accept insert_shard_id" in response.text
+@@ -197,13 +183,8 @@ def test_remote_write_refuses_insert_shard_id_from_the_profile():
+     )
+     node.query("GRANT INSERT ON default.prom_dist TO prom_pinned")
+     try:
+-        time_series = [
+-            ({"__name__": "profile_metric", "host": host}, {START_TIME + i: float(i)})
+-            for i, host in enumerate(HOSTS)
+-        ]
+-        protobuf = convert_time_series_to_protobuf(time_series)
+-        response = get_response_to_remote_write(
+-            node.ip_address, 9093, "/dist/write?user=prom_pinned&password=", protobuf
++        response = write(
++            "/dist/write?user=prom_pinned&password=", "profile_metric", HOSTS
+         )
+         assert response.status_code == 400
+         assert "does not accept insert_shard_id" in response.text
+@@ -213,23 +194,13 @@ def test_remote_write_refuses_insert_shard_id_from_the_profile():
+ 
+ 
+ def test_remote_write_refuses_one_random_shard_on_a_keyless_wrapper():
+-    time_series = [
+-        ({"__name__": "random_metric", "host": host}, {START_TIME + i: float(i)})
+-        for i, host in enumerate(HOSTS)
+-    ]
+-    protobuf = convert_time_series_to_protobuf(time_series)
+     # Without a shard choice the sink itself refuses a keyless multi-shard wrapper...
+-    response = get_response_to_remote_write(
+-        node.ip_address, 9093, "/keyless/write", protobuf
+-    )
++    response = write("/keyless/write", "random_metric", HOSTS)
+     assert response.status_code >= 400
+     assert "no sharding key provided" in response.text
+     # ...and the setting that would let it scatter whole batches over random shards is refused first.
+-    response = get_response_to_remote_write(
+-        node.ip_address,
+-        9093,
+-        "/keyless/write?insert_distributed_one_random_shard=1",
+-        protobuf,
++    response = write(
++        "/keyless/write?insert_distributed_one_random_shard=1", "random_metric", HOSTS
+     )
+     assert response.status_code == 400
+     assert "BAD_ARGUMENTS" in response.text
+diff --git a/tests/queries/0_stateless/05055_promql_over_distributed.sql b/tests/queries/0_stateless/05055_promql_over_distributed.sql
+index 92a3dab0844..3782bd9889c 100644
+--- a/tests/queries/0_stateless/05055_promql_over_distributed.sql
++++ b/tests/queries/0_stateless/05055_promql_over_distributed.sql
+@@ -1,7 +1,6 @@
+ -- Tags: no-parallel, no-fasttest, no-flaky-check, shard
+--- no-parallel: uses the global shard_0 / shard_1 databases of test_cluster_two_shards_different_databases.
++-- no-parallel, no-flaky-check: uses the global shard_0 / shard_1 databases of test_cluster_two_shards_different_databases.
+ -- no-fasttest: PromQL needs ANTLR4, which is disabled in the fast-test build.
+--- no-flaky-check: for the same reason, as for the other tests over these two databases.
+ 
+ -- Raw samples are selected on every shard and the PromQL is evaluated on the initiator, so the answer
+ -- must be the same as evaluating it against one local TimeSeries table holding all of the data.
+-- 
+2.43.0
+

@@ -97,6 +97,19 @@ Master moved on since the branch's last merge of Sep 2, and two files conflicted
 
 The merge commit is `f49502b2411` ("Merge remote-tracking branch 'origin/master' into promql-over-distributed", the author's own convention on this branch). Master's other changes to the Prometheus files (remote-write timeout clamping and 503 handling, new PromQL functions, instant-vector timestamp formatting) auto-merged; the test helpers the new tests call kept their signatures.
 
+### Simplification pass (behavior unchanged)
+
+A review of the PR's whole diff for dead code, duplication and over-long comments, with three reviewers (resolver, executors, tests) proposing and one adversarial reviewer verifying. What changed (commit `3000468a377`, patch 0004):
+
+- `resolvePrometheusQueryTarget`: the wrapper's declared shard-skip settings are now two fields of the resolved target instead of a separate accessor and two `std::tie` sites; the probe iterates shards zipped with their addresses (every cluster reachable here is built in lockstep, so the index loops and their bounds guard were dead); the local-shard pre-check uses `getLocalShardCount()`; an empty-block check the remote executor can never satisfy is gone; `hasInstantSelector` is one expression.
+- Executors: the `is_distributed_target` flag is replaced by the `cluster_name` test the sibling path already used; the HTTP handler gets one `getTimeSeriesTable(required_access)` helper for its three "grant before existence, then the table" sites.
+- Docs: the `prometheusQuery`/`prometheusQueryRange` argument docs now say a Distributed wrapper is accepted; the docs parenthetical no longer claims the write pins parallel replicas off.
+- Tests: `error_code`, `keyed_result` and the instant/range endpoint switch live once in `prometheus_test_utils.py`; the write tests build every batch through one `write()` helper and count with a `flush` switch; all seven modules are black-formatted (two were not); every comment and docstring the branch added is at most two lines (five module docstrings, one XML comment and the stateless test's tag block were longer).
+
+What was deliberately kept: the per-class grant re-checks (HTTP API constructor, metadata endpoints, remote read and write constructors, the selector's read, the shared read check's own wrapper `SELECT`). They are reachable code, added on purpose across the earlier review rounds as each class's own access contract; removing them would keep today's behavior only as long as every construction site keeps checking first, which is a security-posture change rather than a simplification. Also kept: test cells a reviewer judged redundant (they cover code paths the PR does not own, cheaply) and the retry-based assertions (dropping them trades stability for lines).
+
+Verification: the repo's C++ style script and `ruff` pass, `black` passes on the seven PR modules, a clang-format dry run over the changed lines proposes only the pre-existing include order of the handler, the comment audit finds no added block over two lines, and the adversarial reviewer confirmed identical behavior (including that a zero-row block cannot reach the probe loop and that no assertion depends on the sample values the write helper changes).
+
 ## 2. The AST fuzzer failure is not this PR's
 
 What the bot links: `Not-ready Set is passed as the second argument for function 'A (STID: 0250-4e52)` → issue #117806. That link is by normalized message only (the STID replaces every identifier with `A`, so every `Not-ready Set` error shares it). Issue #117806 was an object-storage `_path GLOBAL IN` query, closed as a duplicate fixed by PR #112968 (merged Sep 3, after this branch's last merge of master on Sep 2). The failure on this PR is a different shape:
@@ -136,10 +149,12 @@ Suggested stand-down comment for the PR:
 
 ## 3. What is in this directory and how to use it
 
-All three patches below were pushed to the PR branch `valerypetrov/ClickHouse:promql-over-distributed` (`a7a3a2501`, then the round-2 follow-up `3c20def968ed6690c862b811f2b276e32fb6643e`, then the comment-only `687057e62`), so PR 117170 already carries them; the files are kept here as the record. The stand-down comment in section 2 still has to be posted on the PR by hand.
+All four patches below were pushed to the PR branch `valerypetrov/ClickHouse:promql-over-distributed` (`a7a3a2501`, the round-2 follow-up `3c20def968ed6690c862b811f2b276e32fb6643e`, the comment-only `687057e62`, and after the master merge `f49502b` the simplification `3000468a377` plus its assertion-message follow-up), so PR 117170 already carries them; the files are kept here as the record. The stand-down comment in section 2 still has to be posted on the PR by hand.
 
 - `0001-Check-the-local-shard-s-own-grants-before-the-promet.patch`: the grant pre-check, on top of `e1ae54c`. Files: `src/Storages/TimeSeries/resolvePrometheusQueryTarget.{cpp,h}`, `docs/concepts/features/interfaces/prometheus.mdx`, `tests/integration/test_prometheus_protocols/test_local_shard_distributed.py`.
 - `0003-Name-the-pin-where-the-shard-probe-and-the-grant-pre.patch`: comment-only; names the pin at the two assumption points in `resolvePrometheusQueryTarget.cpp`.
+- `0004-Simplify-the-distributed-prometheus-code-and-tests-w.patch`: the behavior-preserving simplification pass (on top of the master merge `f49502b`).
+- `0005-Keep-the-response-body-in-the-remote-write-success-a.patch`: keeps the server's response text in the two remote-write success assertions (a diagnostic the shared helper had dropped).
 - `0002-Pin-a-shard-that-is-this-server-itself-to-the-in-pro.patch`: the round-2 pin, on top of the first. Files: `src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp`, `src/Storages/StoragePrometheusQuery.cpp`, `src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp`, `src/Storages/TimeSeries/resolvePrometheusQueryTarget.{cpp,h}`, the docs, `tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml` and the test module.
 
 ```sh
