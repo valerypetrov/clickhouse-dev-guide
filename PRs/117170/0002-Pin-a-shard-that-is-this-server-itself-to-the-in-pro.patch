@@ -1,0 +1,214 @@
+From 5242f1a9922c0c56c9d6f7721300a74b093c00c6 Mon Sep 17 00:00:00 2001
+From: Valery Petrov <valerypetrov@icloud.com>
+Date: Sat, 5 Sep 2026 03:12:02 +0000
+Subject: [PATCH] Pin a shard that is this server itself to the in-process path
+
+The shard-target check and the pre-check of the local shard's grants
+both assume a shard that is this server itself is read and written in
+process, on the caller's context: that is where an undeclared database
+resolves to the caller's current one. SelectStreamFactory and the sink
+take that path only with prefer_localhost_replica on and, for a read,
+task-based parallel replicas off; a caller setting them the other way
+had the probe validate one table while the shard read another, and the
+grant pre-check ask for grants the connection path never needs.
+
+Pin both on the generated cluster() read and on the write's context, as
+the write already pins its delivery settings, so the three places agree
+whatever the caller brings. The probe treats a local replica as this
+context unconditionally. The tests read a wrapper over a one-replica
+and a two-replica local shard with prefer_localhost_replica off and with
+parallel replicas on, and expect the caller's own database either way,
+with the grant refusal still first.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016i1XnLC3KypZdaYYsfzqub
+---
+ .../features/interfaces/prometheus.mdx        |  2 +-
+ .../PrometheusQueryToSQL/fromSelector.cpp     |  3 ++
+ .../PrometheusRemoteWriteProtocol.cpp         |  2 +
+ .../resolvePrometheusQueryTarget.cpp          |  9 ++--
+ .../configs/config.d/local_shard_dist.xml     | 13 ++++++
+ .../test_local_shard_distributed.py           | 44 ++++++++++++++++++-
+ 6 files changed, 64 insertions(+), 9 deletions(-)
+
+diff --git a/docs/concepts/features/interfaces/prometheus.mdx b/docs/concepts/features/interfaces/prometheus.mdx
+index c41ee1816..5d63bb00f 100644
+--- a/docs/concepts/features/interfaces/prometheus.mdx
++++ b/docs/concepts/features/interfaces/prometheus.mdx
+@@ -86,7 +86,7 @@ ClickHouse implements the Prometheus HTTP API over a [`TimeSeries`](/reference/e
+ 
+ The query endpoints, remote write, and the `prometheusQuery`/`prometheusQueryRange` table functions also accept a `Distributed` table over per-shard `TimeSeries` tables: samples are selected on every shard and the PromQL is evaluated on the initiator, and writes are routed through the `Distributed` sink. Remote read and the metadata endpoints (`/api/v1/series`, `/api/v1/labels`, `/api/v1/label/<name>/values`, `/api/v1/metadata`) remain `TimeSeries`-only and refuse a `Distributed` target.
+ 
+-Every shard-local table behind such a `Distributed` table must be a `TimeSeries` table declaring the same `time_series` type as the `Distributed` table itself; a mismatch is refused rather than rounded, and the check asks every replica of every shard on every request, so a shard-local table swapped for another under the same name is caught by the next request rather than written into. A read is not failed by a replica the check cannot reach or that has no table of that name: whether the read itself fails is decided, as before, by its own `skip_unavailable_shards` settings. Remote write, however, is refused (with a retryable `5xx`) while any replica is unreachable, has no table of that name, or does not show that table's `time_series` type, because a replica the check could not see would still receive the samples unchecked. When the `Distributed` table declares no database, each shard resolves the name in its own default database, except a shard that is this server itself, which resolves it in the requesting user's current database, exactly as any query here would. Reading through it needs `SELECT` on the `Distributed` table and `READ ON REMOTE`, because the query is rewritten into a `cluster()` call; both are checked before the shard-local check above runs, so a caller without either is refused with a plain access error rather than told what the shards hold. The `prometheusQuery`/`prometheusQueryRange` table functions need `CREATE TEMPORARY TABLE` on top of those, as they do over a `TimeSeries` table; the query endpoints name the selector inside the `cluster()` call for each shard to resolve, so they need it only for a shard that is this server itself, together with `SELECT` on that shard's table; both are checked before the shard-local check runs too. Writing needs `INSERT` on the `Distributed` table only.
++Every shard-local table behind such a `Distributed` table must be a `TimeSeries` table declaring the same `time_series` type as the `Distributed` table itself; a mismatch is refused rather than rounded, and the check asks every replica of every shard on every request, so a shard-local table swapped for another under the same name is caught by the next request rather than written into. A read is not failed by a replica the check cannot reach or that has no table of that name: whether the read itself fails is decided, as before, by its own `skip_unavailable_shards` settings. Remote write, however, is refused (with a retryable `5xx`) while any replica is unreachable, has no table of that name, or does not show that table's `time_series` type, because a replica the check could not see would still receive the samples unchecked. When the `Distributed` table declares no database, each shard resolves the name in its own default database, except a shard that is this server itself, which is always read and written in-process (`prefer_localhost_replica` is pinned on and parallel replicas off for these paths) and so resolves it in the requesting user's current database, exactly as any query here would. Reading through it needs `SELECT` on the `Distributed` table and `READ ON REMOTE`, because the query is rewritten into a `cluster()` call; both are checked before the shard-local check above runs, so a caller without either is refused with a plain access error rather than told what the shards hold. The `prometheusQuery`/`prometheusQueryRange` table functions need `CREATE TEMPORARY TABLE` on top of those, as they do over a `TimeSeries` table; the query endpoints name the selector inside the `cluster()` call for each shard to resolve, so they need it only for a shard that is this server itself, together with `SELECT` on that shard's table; both are checked before the shard-local check runs too. Writing needs `INSERT` on the `Distributed` table only.
+ 
+ Remote write into a `Distributed` target is an `INSERT` through that table's sink with [`distributed_foreground_insert`](/reference/settings/session-settings/distributed#distributed_foreground_insert) forced on and [`async_insert`](/reference/settings/session-settings/async-insert#async_insert) forced off, whatever the handler's user profile or the `remote_write` URL says: the samples are not queued on the initiator, by the sink or by the asynchronous insert queue, but delivered to the shards before the response, so a `204` means every shard (one replica per shard under `internal_replication`) has accepted them, and a shard that fails the insert fails the write with a retryable `5xx`, which Prometheus answers by resending the batch. A batch left in either queue would be flushed after the check above, into whatever answers to the shard-local name by then, which is why background delivery is not offered on this path. [`skip_unavailable_shards`](/reference/settings/session-settings/skip-unavailable-shards#skip_unavailable_shards) is forced off on this path too, whatever the URL or the profile says: a shard the sink skipped would be samples dropped under a `204`. The routing settings `insert_shard_id` and `insert_distributed_one_random_shard` are refused on this path, whether they come from the URL or from the profile: a batch goes where the table's sharding key sends it, so a `Distributed` table with several shards and no key cannot be written through remote write.
+ 
+diff --git a/src/Storages/TimeSeries/PrometheusQueryToSQL/fromSelector.cpp b/src/Storages/TimeSeries/PrometheusQueryToSQL/fromSelector.cpp
+index 900b57359..a6cf1d9aa 100644
+--- a/src/Storages/TimeSeries/PrometheusQueryToSQL/fromSelector.cpp
++++ b/src/Storages/TimeSeries/PrometheusQueryToSQL/fromSelector.cpp
+@@ -67,6 +67,9 @@ namespace
+         /// Always ship the query text: a serialized plan binds an unqualified name on the
+         /// initiator, and shards do not apply their own row policies to a shipped plan (#112891).
+         cluster_builder.settings_changes.emplace_back("serialize_query_plan", false);
++        /// A shard that is this server itself is always read in-process, as the shard-target check assumes.
++        cluster_builder.settings_changes.emplace_back("prefer_localhost_replica", true);
++        cluster_builder.settings_changes.emplace_back("enable_parallel_replicas", false);
+ 
+         /// SELECT timeSeriesTagsToGroup(tags) AS group, timestamp, value FROM view(<cluster query>)
+         /// Groups are node-local: without the view() the whole query goes to the shards, which each restart their own counter.
+diff --git a/src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp b/src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp
+index 3ca4f0b05..a42fa3103 100644
+--- a/src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp
++++ b/src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp
+@@ -311,6 +311,8 @@ PrometheusRemoteWriteProtocol::PrometheusRemoteWriteProtocol(
+         context_->setSetting("async_insert", false);
+         /// A shard the sink skipped is a silent drop under a 204: fail the write closed, as the check does.
+         context_->setSetting("skip_unavailable_shards", false);
++        /// A shard that is this server itself is always written in-process, as the shard-target check assumes.
++        context_->setSetting("prefer_localhost_replica", true);
+     }
+ }
+ 
+diff --git a/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp b/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp
+index 8eccc23fa..85b8dc45e 100644
+--- a/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp
++++ b/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp
+@@ -43,7 +43,6 @@ namespace Setting
+     extern const SettingsUInt64 max_parser_backtracks;
+     extern const SettingsUInt64 max_parser_depth;
+     extern const SettingsUInt64 max_query_size;
+-    extern const SettingsBool prefer_localhost_replica;
+ }
+ 
+ namespace DistributedSetting
+@@ -139,9 +138,8 @@ namespace
+         const auto metadata = storage.getInMemoryMetadataPtr(context, false);
+         const auto time_series_type = metadata->columns.get(TimeSeriesColumnNames::TimeSeries).type->getName();
+ 
+-        /// Sent as text over each replica's own connection, so an undeclared remote database resolves to that
+-        /// replica's configured default - except where the sink and the rewrite skip the connection and run on
+-        /// this context instead (DistributedSink, SelectStreamFactory), which resolves it here.
++        /// Sent over each replica's own connection, so an undeclared database is that replica's default; a replica
++        /// that is this server itself is read and written in-process instead, so the name resolves on this context.
+         auto make_probe_query = [&](bool runs_on_the_caller)
+         {
+             const String database_predicate = !remote_id.database_name.empty()
+@@ -168,7 +166,6 @@ namespace
+         std::set<String> wrong_types;
+         /// Unreachable, or without the table: the sink cannot use them either, and what answers to the name later is unchecked.
+         Strings unavailable_replicas;
+-        const bool prefer_localhost_replica = context->getSettingsRef()[Setting::prefer_localhost_replica];
+         const auto & shards_info = cluster->getShardsInfo();
+         const auto & shards_addresses = cluster->getShardsAddresses();
+         for (size_t shard_index = 0; shard_index != shards_info.size(); ++shard_index)
+@@ -176,7 +173,7 @@ namespace
+             {
+                 const auto & pool = shards_info[shard_index].per_replica_pools[replica_index];
+                 /// A cluster assembled from a subset of another carries no addresses: treat those as remote.
+-                const bool runs_on_the_caller = prefer_localhost_replica && shard_index < shards_addresses.size()
++                const bool runs_on_the_caller = shard_index < shards_addresses.size()
+                     && replica_index < shards_addresses[shard_index].size() && shards_addresses[shard_index][replica_index].is_local;
+                 RemoteQueryExecutor probe(pool, make_probe_query(runs_on_the_caller), probe_header, probe_context);
+                 bool answered = false;
+diff --git a/tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml b/tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml
+index c7a5def9b..83aa81ab7 100644
+--- a/tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml
++++ b/tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml
+@@ -11,5 +11,18 @@
+                 </replica>
+             </shard>
+         </local_shard_dist>
++        <!-- The same local replica twice: a shard that parallel replicas could spread over. -->
++        <local_shard_two_replicas>
++            <shard>
++                <replica>
++                    <host>localhost</host>
++                    <port>9000</port>
++                </replica>
++                <replica>
++                    <host>localhost</host>
++                    <port>9000</port>
++                </replica>
++            </shard>
++        </local_shard_two_replicas>
+     </remote_servers>
+ </clickhouse>
+diff --git a/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py b/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py
+index e0e74716a..d282f2dd0 100644
+--- a/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py
++++ b/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py
+@@ -51,6 +51,12 @@ RESTRICTED_CALLERS = [
+ # What the shard probe says about that table, in the words no denied caller may see.
+ SHARD_LOCAL_LEAK = ["shard-local", "not TimeSeries", "UNEXPECTED_TABLE_ENGINE"]
+ 
++# Fan-out settings a caller may bring; the generated read pins both the other way.
++CALLER_FAN_OUT_SETTINGS = [
++    {"prefer_localhost_replica": 0},
++    {"enable_parallel_replicas": 1, "max_parallel_replicas": 2},
++]
++
+ 
+ @pytest.fixture(scope="module", autouse=True)
+ def start_cluster():
+@@ -67,6 +73,10 @@ def start_cluster():
+             "CREATE TABLE metrics.prom_local AS metrics.ts_local "
+             "ENGINE = Distributed(local_shard_dist, '', ts_local)"
+         )
++        node.query(
++            "CREATE TABLE metrics.prom_two AS metrics.ts_local "
++            "ENGINE = Distributed(local_shard_two_replicas, '', ts_local)"
++        )
+ 
+         # The same pair the other way round: healthy where the probe used to look, wrong engine
+         # where the sink actually writes.
+@@ -139,9 +149,9 @@ def test_remote_write_is_refused_when_only_the_probes_database_is_healthy():
+     assert int(node.query("SELECT count() FROM timeSeriesTags(default.ts_swap)")) == 0
+ 
+ 
+-def query_as(endpoint, user):
++def query_as(endpoint, user, settings=None):
+     """The error of the instant or range PromQL endpoint for a caller of this name."""
+-    params = {"user": user, "password": ""}
++    params = {"user": user, "password": "", **(settings or {})}
+     if endpoint == "query":
+         return execute_query_via_http_api(
+             node.ip_address,
+@@ -206,3 +216,33 @@ def test_table_functions_deny_the_local_shard_grants_before_probing(
+     # The client prints the server's stack trace after the message; its frames name source files.
+     denied = node.query_and_get_error(sql, user=user).split("Stack trace:")[0]
+     assert_denied_without_leaking(denied, grant)
++
++
++@pytest.mark.parametrize("settings", CALLER_FAN_OUT_SETTINGS)
++@pytest.mark.parametrize("wrapper", ["metrics.prom_local", "metrics.prom_two"])
++def test_reads_keep_the_local_shard_in_process_whatever_the_caller_fans_out(
++    wrapper, settings
++):
++    """Read over the connection, the shard would resolve `ts_local` in the pool's database: the
++    probe and the read must agree, so a shard that is this server is read here regardless.
++    """
++    sql = (
++        f"SELECT count() FROM prometheusQuery({wrapper}, 'local_metric', {START_TIME})"
++    )
++    assert node.query(sql, user="prom_metrics", settings=settings).strip() == "1"
++
++    result = json.loads(
++        execute_query_via_http_api(
++            node.ip_address,
++            9093,
++            "/local_api/query",
++            "local_metric",
++            START_TIME,
++            params={**CALLER_PARAMS, **settings},
++        )
++    )["result"]
++    assert [sample["value"][1] for sample in result] == ["1"]
++
++    # And the grants of that in-process read are still asked for first.
++    denied = query_as("query", NO_SHARD_SELECT_USER, settings)
++    assert_denied_without_leaking(denied, "SELECT ON default.ts_local")
+-- 
+2.43.0
+

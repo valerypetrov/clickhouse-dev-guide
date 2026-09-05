@@ -66,6 +66,24 @@ The tests run on the `local_shard_dist` cluster of `test_local_shard_distributed
 
 The remote-write probe (`checkPrometheusQueryDistributedWrite`) has a smaller analogue: with `prefer_localhost_replica` on, `DistributedSink` inserts into a local shard through `InterpreterInsertQuery` on the caller's context, which enforces `INSERT` on the shard-local table (with the column list) after the probe has spoken. The bot did not flag it, it is gated by a setting, and it needs the sink's column list to mirror column-level grants, so it is left for a follow-up rather than widening this change.
 
+### Round 2: the follow-up review on a7a3a25
+
+The bot's next review accepted the grant pre-check but blocked on consistency: three places must agree on which shard is read in-process on the caller's context, and they did not.
+
+- `SelectStreamFactory` takes the local plan only with `prefer_localhost_replica = 1` and task-based parallel replicas off; the Distributed sink writes a local shard in-process only with `prefer_localhost_replica = 1`.
+- The shard probe resolved an undeclared database as the caller's current database for a local replica when `prefer_localhost_replica` was on, ignoring parallel replicas; the grant pre-check fired for any local shard regardless of either setting.
+- So a caller bringing `prefer_localhost_replica = 0`, or parallel replicas on a multi-replica shard, had the probe validate one table (`metrics.ts_local`) while the shard read another (`ts_local` in the connection's default database), and was asked for grants the connection path never uses.
+
+The reviewer offered two fixes: share the exact "local plan under the caller's context" predicate, or disable those modes for the generated read. The second is a few lines and removes the disagreement instead of tracking it, so that is what the follow-up commit does:
+
+- The generated `cluster()` read carries `SETTINGS prefer_localhost_replica = 1, enable_parallel_replicas = 0` next to the `serialize_query_plan = 0` the PR already pins there. A SELECT's own `SETTINGS` clause is applied to that query node's context by the query tree builder, which is the context the planner hands to `StorageDistributed::read`, so `SelectStreamFactory` and `ClusterProxy::executeQuery` see the pinned values.
+- The remote-write context pins `prefer_localhost_replica = 1` next to the delivery settings it already forces, so the sink writes a local shard in-process too.
+- The probe treats a local replica as the caller's own context unconditionally (`runs_on_the_caller = address.is_local`), and the `Setting::prefer_localhost_replica` extern goes away.
+- Docs: one parenthetical in the sentence that already stated the in-process semantics for a local shard.
+- Tests: a second cluster with the same local replica listed twice (a shard parallel replicas could spread over), a wrapper over it, and one parametrized test that reads both wrappers with `prefer_localhost_replica = 0` and with `enable_parallel_replicas = 1, max_parallel_replicas = 2`, through the table function and the HTTP endpoint, expecting the caller's own database either way (the sample is found; over the connection the shard would hit the MergeTree decoy in `default` and fail), and the grant refusal still first.
+
+Why pinning is safe: the PR's docs already defined a local shard as "resolves it in the requesting user's current database, exactly as any query here would", which is the in-process behaviour; the pin makes that definition hold whatever the caller's fan-out settings say, exactly as the write path already does for `distributed_foreground_insert`, `async_insert` and `skip_unavailable_shards`. The main table of the generated read is the `view()` storage, not a replicated table, so the stale-replica fallback that `prefer_localhost_replica = 0` is normally used for does not apply.
+
 ## 2. The AST fuzzer failure is not this PR's
 
 What the bot links: `Not-ready Set is passed as the second argument for function 'A (STID: 0250-4e52)` → issue #117806. That link is by normalized message only (the STID replaces every identifier with `A`, so every `Not-ready Set` error shares it). Issue #117806 was an object-storage `_path GLOBAL IN` query, closed as a duplicate fixed by PR #112968 (merged Sep 3, after this branch's last merge of master on Sep 2). The failure on this PR is a different shape:
@@ -105,13 +123,14 @@ Suggested stand-down comment for the PR:
 
 ## 3. What is in this directory and how to use it
 
-The patch below was pushed to the PR branch `valerypetrov/ClickHouse:promql-over-distributed` as commit `a7a3a2501c4a18b8384fc519e93e80354e522cb4` on top of `e1ae54c`, so PR 117170 already carries it; the file is kept here as the record. The stand-down comment in section 2 still has to be posted on the PR by hand.
+Both patches below were pushed to the PR branch `valerypetrov/ClickHouse:promql-over-distributed` (first `a7a3a2501`, then the round-2 follow-up), so PR 117170 already carries them; the files are kept here as the record. The stand-down comment in section 2 still has to be posted on the PR by hand.
 
-- `0001-Check-the-local-shard-s-own-grants-before-the-promet.patch`: the fix, on top of `e1ae54c` (`git am` it onto `promql-over-distributed`). Files: `src/Storages/TimeSeries/resolvePrometheusQueryTarget.{cpp,h}`, `docs/concepts/features/interfaces/prometheus.mdx`, `tests/integration/test_prometheus_protocols/test_local_shard_distributed.py`.
+- `0001-Check-the-local-shard-s-own-grants-before-the-promet.patch`: the grant pre-check, on top of `e1ae54c`. Files: `src/Storages/TimeSeries/resolvePrometheusQueryTarget.{cpp,h}`, `docs/concepts/features/interfaces/prometheus.mdx`, `tests/integration/test_prometheus_protocols/test_local_shard_distributed.py`.
+- `0002-Pin-a-shard-that-is-this-server-itself-to-the-in-pro.patch`: the round-2 pin, on top of the first. Files: `src/Storages/TimeSeries/PrometheusQueryToSQL/fromSelector.cpp`, `src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp`, `src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp`, the docs, `tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml` and the test module.
 
 ```sh
 git checkout promql-over-distributed
-git am PRs/117170/0001-Check-the-local-shard-s-own-grants-before-the-promet.patch
+git am PRs/117170/0001-*.patch PRs/117170/0002-*.patch
 ```
 
 Run the tests that cover the change:
