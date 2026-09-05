@@ -82,6 +82,10 @@ The reviewer offered two fixes: share the exact "local plan under the caller's c
 - Docs: one parenthetical in the sentence that already stated the in-process semantics for a local shard.
 - Tests: a second cluster with the same local replica listed twice (a shard parallel replicas could spread over), a wrapper over it, and one test over three explicit cases (each wrapper with `prefer_localhost_replica = 0`, and the two-replica wrapper with `enable_parallel_replicas = 1, max_parallel_replicas = 2`; the one-replica wrapper never fans out under parallel replicas, so that cell would prove nothing) that reads through the table function and the HTTP endpoint, expecting the caller's own database either way (the sample is found; over the connection the shard would hit the MergeTree decoy in `default` and fail), and the grant refusal still first.
 
+The bot's comment on the PR still shows the review of a7a3a25 (it says "measured on commit a7a3a25") because CI had not yet started on 3c20def96 when this was written; the blocker text above is that review, not a new one. A third, comment-only commit (`687057e62`, patch 0003) names the pin at the two places in `resolvePrometheusQueryTarget.cpp` that rely on it (the probe's database resolution and the grant pre-check), so the guarantee is visible where it is assumed rather than only in the executors.
+
+On a7a3a25, CI came back green for everything that matters: `AST fuzzer (amd_debug)` passed (the earlier failure was the unrelated master bug from section 2), `Code Review`, `Style check` and `Fast test` passed; the only red jobs were the two `Docker ... image` builds for arm64, which do not touch this code.
+
 Why pinning is safe: the PR's docs already defined a local shard as "resolves it in the requesting user's current database, exactly as any query here would", which is the in-process behaviour; the pin makes that definition hold whatever the caller's fan-out settings say, exactly as the write path already does for `distributed_foreground_insert`, `async_insert` and `skip_unavailable_shards`. The main table of the generated read is the `view()` storage, not a replicated table, so the stale-replica fallback that `prefer_localhost_replica = 0` is normally used for does not apply.
 
 ## 2. The AST fuzzer failure is not this PR's
@@ -123,14 +127,15 @@ Suggested stand-down comment for the PR:
 
 ## 3. What is in this directory and how to use it
 
-Both patches below were pushed to the PR branch `valerypetrov/ClickHouse:promql-over-distributed` (first `a7a3a2501`, then the round-2 follow-up `3c20def968ed6690c862b811f2b276e32fb6643e`), so PR 117170 already carries them; the files are kept here as the record. The stand-down comment in section 2 still has to be posted on the PR by hand.
+All three patches below were pushed to the PR branch `valerypetrov/ClickHouse:promql-over-distributed` (`a7a3a2501`, then the round-2 follow-up `3c20def968ed6690c862b811f2b276e32fb6643e`, then the comment-only `687057e62`), so PR 117170 already carries them; the files are kept here as the record. The stand-down comment in section 2 still has to be posted on the PR by hand.
 
 - `0001-Check-the-local-shard-s-own-grants-before-the-promet.patch`: the grant pre-check, on top of `e1ae54c`. Files: `src/Storages/TimeSeries/resolvePrometheusQueryTarget.{cpp,h}`, `docs/concepts/features/interfaces/prometheus.mdx`, `tests/integration/test_prometheus_protocols/test_local_shard_distributed.py`.
+- `0003-Name-the-pin-where-the-shard-probe-and-the-grant-pre.patch`: comment-only; names the pin at the two assumption points in `resolvePrometheusQueryTarget.cpp`.
 - `0002-Pin-a-shard-that-is-this-server-itself-to-the-in-pro.patch`: the round-2 pin, on top of the first. Files: `src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp`, `src/Storages/StoragePrometheusQuery.cpp`, `src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp`, `src/Storages/TimeSeries/resolvePrometheusQueryTarget.{cpp,h}`, the docs, `tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml` and the test module.
 
 ```sh
 git checkout promql-over-distributed
-git am PRs/117170/0001-*.patch PRs/117170/0002-*.patch
+git am PRs/117170/000*.patch
 ```
 
 Run the tests that cover the change:
