@@ -88,6 +88,15 @@ On a7a3a25, CI came back green for everything that matters: `AST fuzzer (amd_deb
 
 Why pinning is safe: the PR's docs already defined a local shard as "resolves it in the requesting user's current database, exactly as any query here would", which is the in-process behaviour; the pin makes that definition hold whatever the caller's fan-out settings say, exactly as the write path already does for `distributed_foreground_insert`, `async_insert` and `skip_unavailable_shards`. The main table of the generated read is the `view()` storage, not a replicated table, so the stale-replica fallback that `prefer_localhost_replica = 0` is normally used for does not apply.
 
+### Master merged (conflicts resolved)
+
+Master moved on since the branch's last merge of Sep 2, and two files conflicted, both because the user's own PR #117816 (merged Sep 3) made the two PromQL executors run the generated SQL on a fresh `query_context` copy with `empty_result_for_aggregation_by_empty_set = 0`, exactly where the round-2 pin sits:
+
+- `src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp`: kept master's `query_context` copy and moved the pin onto it (it had been on `getContext()`), so `executeQuery` runs on the pinned copy.
+- `src/Storages/StoragePrometheusQuery.cpp`: kept master's copy and the new setting, then the pin block, unchanged.
+
+The merge commit is `f49502b2411` ("Merge remote-tracking branch 'origin/master' into promql-over-distributed", the author's own convention on this branch). Master's other changes to the Prometheus files (remote-write timeout clamping and 503 handling, new PromQL functions, instant-vector timestamp formatting) auto-merged; the test helpers the new tests call kept their signatures.
+
 ## 2. The AST fuzzer failure is not this PR's
 
 What the bot links: `Not-ready Set is passed as the second argument for function 'A (STID: 0250-4e52)` → issue #117806. That link is by normalized message only (the STID replaces every identifier with `A`, so every `Not-ready Set` error shares it). Issue #117806 was an object-storage `_path GLOBAL IN` query, closed as a duplicate fixed by PR #112968 (merged Sep 3, after this branch's last merge of master on Sep 2). The failure on this PR is a different shape:
