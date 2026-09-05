@@ -1,4 +1,4 @@
-From 6ea7b59c03b15769cc796bdb698f4d617bcba278 Mon Sep 17 00:00:00 2001
+From 3c20def968ed6690c862b811f2b276e32fb6643e Mon Sep 17 00:00:00 2001
 From: Valery Petrov <valerypetrov@icloud.com>
 Date: Sat, 5 Sep 2026 03:12:02 +0000
 Subject: [PATCH] Pin a shard that is this server itself to the in-process path
@@ -30,9 +30,9 @@ Claude-Session: https://claude.ai/code/session_016i1XnLC3KypZdaYYsfzqub
  .../PrometheusRemoteWriteProtocol.cpp         |  2 +
  .../resolvePrometheusQueryTarget.cpp          |  9 ++--
  .../TimeSeries/resolvePrometheusQueryTarget.h |  7 +--
- .../configs/config.d/local_shard_dist.xml     | 13 ++++++
- .../test_local_shard_distributed.py           | 44 ++++++++++++++++++-
- 8 files changed, 77 insertions(+), 18 deletions(-)
+ .../configs/config.d/local_shard_dist.xml     | 13 +++++
+ .../test_local_shard_distributed.py           | 49 ++++++++++++++++++-
+ 8 files changed, 82 insertions(+), 18 deletions(-)
 
 diff --git a/docs/concepts/features/interfaces/prometheus.mdx b/docs/concepts/features/interfaces/prometheus.mdx
 index c41ee1816..5d63bb00f 100644
@@ -185,23 +185,25 @@ index c7a5def9b..83aa81ab7 100644
      </remote_servers>
  </clickhouse>
 diff --git a/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py b/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py
-index e0e74716a..d282f2dd0 100644
+index e0e74716a..b99f2f7ed 100644
 --- a/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py
 +++ b/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py
-@@ -51,6 +51,12 @@ RESTRICTED_CALLERS = [
+@@ -51,6 +51,14 @@ RESTRICTED_CALLERS = [
  # What the shard probe says about that table, in the words no denied caller may see.
  SHARD_LOCAL_LEAK = ["shard-local", "not TimeSeries", "UNEXPECTED_TABLE_ENGINE"]
  
-+# Fan-out settings a caller may bring; the generated read pins both the other way.
-+CALLER_FAN_OUT_SETTINGS = [
-+    {"prefer_localhost_replica": 0},
-+    {"enable_parallel_replicas": 1, "max_parallel_replicas": 2},
++# Fan-out settings a caller may bring, each over a wrapper they would send over the connection;
++# the read pins both the other way.
++CALLER_FAN_OUT = [
++    ("metrics.prom_local", {"prefer_localhost_replica": 0}),
++    ("metrics.prom_two", {"prefer_localhost_replica": 0}),
++    ("metrics.prom_two", {"enable_parallel_replicas": 1, "max_parallel_replicas": 2}),
 +]
 +
  
  @pytest.fixture(scope="module", autouse=True)
  def start_cluster():
-@@ -67,6 +73,10 @@ def start_cluster():
+@@ -67,6 +75,10 @@ def start_cluster():
              "CREATE TABLE metrics.prom_local AS metrics.ts_local "
              "ENGINE = Distributed(local_shard_dist, '', ts_local)"
          )
@@ -212,7 +214,7 @@ index e0e74716a..d282f2dd0 100644
  
          # The same pair the other way round: healthy where the probe used to look, wrong engine
          # where the sink actually writes.
-@@ -139,9 +149,9 @@ def test_remote_write_is_refused_when_only_the_probes_database_is_healthy():
+@@ -139,9 +151,9 @@ def test_remote_write_is_refused_when_only_the_probes_database_is_healthy():
      assert int(node.query("SELECT count() FROM timeSeriesTags(default.ts_swap)")) == 0
  
  
@@ -224,14 +226,17 @@ index e0e74716a..d282f2dd0 100644
      if endpoint == "query":
          return execute_query_via_http_api(
              node.ip_address,
-@@ -206,3 +216,33 @@ def test_table_functions_deny_the_local_shard_grants_before_probing(
+@@ -206,3 +218,36 @@ def test_table_functions_deny_the_local_shard_grants_before_probing(
      # The client prints the server's stack trace after the message; its frames name source files.
      denied = node.query_and_get_error(sql, user=user).split("Stack trace:")[0]
      assert_denied_without_leaking(denied, grant)
 +
 +
-+@pytest.mark.parametrize("settings", CALLER_FAN_OUT_SETTINGS)
-+@pytest.mark.parametrize("wrapper", ["metrics.prom_local", "metrics.prom_two"])
++@pytest.mark.parametrize(
++    "wrapper, settings",
++    CALLER_FAN_OUT,
++    ids=["no_local_replica", "no_local_replica_of_two", "parallel_replicas"],
++)
 +def test_reads_keep_the_local_shard_in_process_whatever_the_caller_fans_out(
 +    wrapper, settings
 +):
