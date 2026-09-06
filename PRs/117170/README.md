@@ -114,6 +114,24 @@ Verification: the repo's C++ style script and `ruff` pass, `black` passes on the
 
 Master (5cbca3e, Sep 5 20:45 UTC) added schema versioning to the TimeSeries engine with guards at the PromQL and remote-write entry points; four files conflicted because those guards take the TimeSeries table itself while the PR's entry points hold a storage that may be a Distributed wrapper. Resolution (merge `ad5ec290192`): the initiator runs `checkTimeSeriesVersionSupportedByPromQL` / `checkTimeSeriesVersionIsWritable` only when the target is a TimeSeries table (right after `resolvePrometheusQueryTarget` says so); over a wrapper the shards apply them, in the selector each shard runs and in `StorageTimeSeries::write`, which master also guards. One auto-merged call in the table function's read path would have cast the wrapper and thrown, so it is gated on the target's cluster name. The two files the PR had switched to the generic storage header include `StorageTimeSeries.h` again for the cast idiom master uses.
 
+### Round 3: the check-then-insert race in remote write
+
+The bot's next review (on `ad5ec290192`) blocked on `PrometheusRemoteWriteProtocol::write`: `checkPrometheusQueryDistributedWrite` is a preflight on the request thread, and once it returns another session can `EXCHANGE` a same-schema non-TimeSeries table under a shard-local name before `insertBlock` runs; the ordinary Distributed sink then accepts the batch into that table and the write answers `204`. It asked for the validation to move into the delivery path, or for the validated identity to be synchronized with shard-local DDL, plus a test that pauses the write between the two, swaps a target, and asserts the write is rejected rather than acknowledged.
+
+What the fix does (commit `e5fe445b401`, patch 0006):
+
+- The probe (`probeShardTargets`) now returns one `PrometheusShardTargetIdentity` per replica: whether it answered, the engine, the `time_series` column type, and the table UUID (a third scalar subquery on `system.tables`). The verdict (`checkShardTargets`, the old name) is unchanged: same decisions, same messages, for both the read and the write.
+- `checkPrometheusQueryDistributedWrite` returns those identities; after `insertBlock`, a new `checkPrometheusQueryDistributedWriteDelivered` probes every replica again and compares. Any replica whose identity differs, a cluster of another size, or a re-probe that throws at all (a replica gone after delivery, a remote error) leaves the write unacknowledged with `UNKNOWN_STATUS_OF_INSERT`, which `exceptionCodeToHTTPStatus` does not list, so it is a 500: Prometheus resends the batch and the next preflight refuses it with `UNEXPECTED_TABLE_ENGINE`. The re-probe is wrapped so nothing after the delivery can turn into a 4xx, which Prometheus would answer by dropping the batch.
+- A `PAUSEABLE_ONCE` failpoint `prometheus_remote_write_before_insert` sits between the check and the insert.
+- Tests: `test_write_distributed.py` pauses a write of one sample routed to shard 0 (`h3` hashes there; a helper agent re-derived CityHash64's short-string path to confirm), exchanges `shard_0.ts_local` with the MergeTree decoy, releases the write, and asserts a 5xx carrying `UNKNOWN_STATUS_OF_INSERT` and `is not acknowledged`, nothing in a TimeSeries table, and a successful retry once the names are swapped back. `test_local_shard_distributed.py` does the same for the in-process local shard (`metrics.ts_local` with `metrics.ts_swap`).
+- Docs: two sentences in the paragraph that already described the per-request check, including the residual below.
+
+What was tried and dropped: holding a `DDLGuard` on the resolved shard-local name for the whole write when the cluster has a local shard, so that `RENAME`/`EXCHANGE`/`DROP`/`CREATE` of that name would wait instead. The adversarial reviewer showed that `DDLGuard` is an exclusive, untimed per-name mutex (`DatabaseCatalog.cpp`, `table_lock = std::unique_lock(*it->second.mutex)`): every concurrent remote-write request on a node that is itself a shard would run one at a time, across the probe, the INSERT to every shard and the re-probe, and a pending `DROP DATABASE` waiting behind one write would make every other `getDDLGuard` in that database time out after a second. The post-delivery witness already covers the local replica (it is probed over TCP like any other), so the guard bought only the local-shard swap-and-swap-back case at that price. The first draft of the local-shard test asserted that the `EXCHANGE` blocks; it was rewritten to expect the swap to go through and the write to be left unacknowledged.
+
+Residual, stated in the commit and the docs: a table swapped in and back under the same name within one request is not seen. Closing it needs the shard to refuse the INSERT itself (a shard-side change to the Distributed sink's INSERT or to `InterpreterInsertQuery`), which is beyond this PR.
+
+Verification: the repo's C++ style script passes; a clang-format dry run proposes only the handler's pre-existing include order; the comment audit finds no added block over two lines; `black` and `ruff` pass on the two test modules; the reviewer confirmed by reading (no build here) that every identifier compiles (`Context::ResolveOrdinary` is no longer used; defaulted `operator==` on the identity struct, `std::views::zip` over two vectors, `fmt::join`, `getCurrentExceptionMessage`), that the read path's decisions and messages are byte-identical to `ad5ec290192`, and that `UNKNOWN_STATUS_OF_INSERT` maps to 500. Master at `319bfd73ff3` (Sep 6) merges cleanly into the branch, so no conflict resolution was needed this round.
+
 ## 2. The AST fuzzer failure is not this PR's
 
 What the bot links: `Not-ready Set is passed as the second argument for function 'A (STID: 0250-4e52)` → issue #117806. That link is by normalized message only (the STID replaces every identifier with `A`, so every `Not-ready Set` error shares it). Issue #117806 was an object-storage `_path GLOBAL IN` query, closed as a duplicate fixed by PR #112968 (merged Sep 3, after this branch's last merge of master on Sep 2). The failure on this PR is a different shape:
@@ -153,12 +171,13 @@ Suggested stand-down comment for the PR:
 
 ## 3. What is in this directory and how to use it
 
-All four patches below were pushed to the PR branch `valerypetrov/ClickHouse:promql-over-distributed` (`a7a3a2501`, the round-2 follow-up `3c20def968ed6690c862b811f2b276e32fb6643e`, the comment-only `687057e62`, and after the master merge `f49502b` the simplification `3000468a377` plus its assertion-message follow-up), so PR 117170 already carries them; the files are kept here as the record. The stand-down comment in section 2 still has to be posted on the PR by hand.
+All six patches below were pushed to the PR branch `valerypetrov/ClickHouse:promql-over-distributed` (`a7a3a2501`, the round-2 follow-up `3c20def968ed6690c862b811f2b276e32fb6643e`, the comment-only `687057e62`, after the master merge `f49502b` the simplification `3000468a377` plus its assertion-message follow-up, and after the second merge `ad5ec290192` the round-3 acknowledgement fix `e5fe445b401`), so PR 117170 already carries them; the files are kept here as the record. The stand-down comment in section 2 still has to be posted on the PR by hand.
 
 - `0001-Check-the-local-shard-s-own-grants-before-the-promet.patch`: the grant pre-check, on top of `e1ae54c`. Files: `src/Storages/TimeSeries/resolvePrometheusQueryTarget.{cpp,h}`, `docs/concepts/features/interfaces/prometheus.mdx`, `tests/integration/test_prometheus_protocols/test_local_shard_distributed.py`.
 - `0003-Name-the-pin-where-the-shard-probe-and-the-grant-pre.patch`: comment-only; names the pin at the two assumption points in `resolvePrometheusQueryTarget.cpp`.
 - `0004-Simplify-the-distributed-prometheus-code-and-tests-w.patch`: the behavior-preserving simplification pass (on top of the master merge `f49502b`).
 - `0005-Keep-the-response-body-in-the-remote-write-success-a.patch`: keeps the server's response text in the two remote-write success assertions (a diagnostic the shared helper had dropped).
+- `0006-Acknowledge-a-distributed-remote-write-only-once-eve.patch`: the round-3 fix (on top of the second master merge `ad5ec290192`). Files: `src/Common/FailPoint.cpp`, `src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp`, `src/Storages/TimeSeries/resolvePrometheusQueryTarget.{cpp,h}`, the docs, `tests/integration/test_prometheus_protocols/test_write_distributed.py` and `test_local_shard_distributed.py`.
 - `0002-Pin-a-shard-that-is-this-server-itself-to-the-in-pro.patch`: the round-2 pin, on top of the first. Files: `src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp`, `src/Storages/StoragePrometheusQuery.cpp`, `src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp`, `src/Storages/TimeSeries/resolvePrometheusQueryTarget.{cpp,h}`, the docs, `tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml` and the test module.
 
 ```sh
@@ -170,7 +189,7 @@ Run the tests that cover the change:
 
 ```sh
 cd tests/integration
-pytest -s test_prometheus_protocols/test_local_shard_distributed.py test_prometheus_protocols/test_access_distributed.py
+pytest -s test_prometheus_protocols/test_local_shard_distributed.py test_prometheus_protocols/test_access_distributed.py test_prometheus_protocols/test_write_distributed.py
 ```
 
 Expected: the four new HTTP cases and the two `prom_no_shard_select` table-function cases fail on `e1ae54c` with the probe's `UNEXPECTED_TABLE_ENGINE` text and pass with the patch; everything else is unchanged.

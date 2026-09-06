@@ -1,0 +1,476 @@
+From e5fe445b4019d8a5c94dd5f664ad80c0f293411a Mon Sep 17 00:00:00 2001
+From: Valery Petrov <valerypetrov@icloud.com>
+Date: Sun, 6 Sep 2026 04:09:45 +0000
+Subject: [PATCH] Acknowledge a distributed remote write only once every shard
+ target is still the table checked
+
+The shard-target check ran before the INSERT and nothing ran after it: a
+same-schema table swapped in under a shard-local name between the two took
+the batch, and the write was acknowledged into it. The write now records
+what every replica holds (engine, `time_series` type, table UUID) in the
+check and asks again after the delivery; any difference, or a replica that
+cannot be asked again, leaves the write unacknowledged with
+UNKNOWN_STATUS_OF_INSERT (a retryable 500), so Prometheus resends the batch
+and the next check refuses it. A table swapped in and back within one
+request is not seen. A DDL guard on a shard that is this server was tried
+and dropped: it serializes every concurrent write on that node.
+
+A pausable failpoint between the check and the INSERT lets the tests swap a
+target meanwhile, both over the connection and in-process.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016i1XnLC3KypZdaYYsfzqub
+---
+ .../features/interfaces/prometheus.mdx        |   2 +-
+ src/Common/FailPoint.cpp                      |   1 +
+ .../PrometheusRemoteWriteProtocol.cpp         |  12 +-
+ .../resolvePrometheusQueryTarget.cpp          | 143 +++++++++++++-----
+ .../TimeSeries/resolvePrometheusQueryTarget.h |  20 ++-
+ .../test_local_shard_distributed.py           |  43 ++++++
+ .../test_write_distributed.py                 |  36 +++++
+ 7 files changed, 216 insertions(+), 41 deletions(-)
+
+diff --git a/docs/concepts/features/interfaces/prometheus.mdx b/docs/concepts/features/interfaces/prometheus.mdx
+index 2f15c1f8a9b..8f37cb5402b 100644
+--- a/docs/concepts/features/interfaces/prometheus.mdx
++++ b/docs/concepts/features/interfaces/prometheus.mdx
+@@ -86,7 +86,7 @@ ClickHouse implements the Prometheus HTTP API over a [`TimeSeries`](/reference/e
+ 
+ The query endpoints, remote write, and the `prometheusQuery`/`prometheusQueryRange` table functions also accept a `Distributed` table over per-shard `TimeSeries` tables: samples are selected on every shard and the PromQL is evaluated on the initiator, and writes are routed through the `Distributed` sink. Remote read and the metadata endpoints (`/api/v1/series`, `/api/v1/labels`, `/api/v1/label/<name>/values`, `/api/v1/metadata`) remain `TimeSeries`-only and refuse a `Distributed` target.
+ 
+-Every shard-local table behind such a `Distributed` table must be a `TimeSeries` table declaring the same `time_series` type as the `Distributed` table itself; a mismatch is refused rather than rounded, and the check asks every replica of every shard on every request, so a shard-local table swapped for another under the same name is caught by the next request rather than written into. A read is not failed by a replica the check cannot reach or that has no table of that name: whether the read itself fails is decided, as before, by its own `skip_unavailable_shards` settings. Remote write, however, is refused (with a retryable `5xx`) while any replica is unreachable, has no table of that name, or does not show that table's `time_series` type, because a replica the check could not see would still receive the samples unchecked. When the `Distributed` table declares no database, each shard resolves the name in its own default database, except a shard that is this server itself, which is always read and written in-process (`prefer_localhost_replica` is pinned on for both, and parallel replicas off for the reads) and so resolves it in the requesting user's current database, exactly as any query here would. Reading through it needs `SELECT` on the `Distributed` table and `READ ON REMOTE`, because the query is rewritten into a `cluster()` call; both are checked before the shard-local check above runs, so a caller without either is refused with a plain access error rather than told what the shards hold. The `prometheusQuery`/`prometheusQueryRange` table functions need `CREATE TEMPORARY TABLE` on top of those, as they do over a `TimeSeries` table; the query endpoints name the selector inside the `cluster()` call for each shard to resolve, so they need it only for a shard that is this server itself, together with `SELECT` on that shard's table; both are checked before the shard-local check runs too. Writing needs `INSERT` on the `Distributed` table only.
++Every shard-local table behind such a `Distributed` table must be a `TimeSeries` table declaring the same `time_series` type as the `Distributed` table itself; a mismatch is refused rather than rounded, and the check asks every replica of every shard on every request, so a shard-local table swapped for another under the same name is caught by the next request rather than read. Remote write asks again once the samples are delivered, and acknowledges the batch only if every replica still holds the table that was checked (its engine, `time_series` type and UUID): a table swapped in meanwhile leaves the batch unacknowledged with a retryable `5xx`, so Prometheus resends it and the next check refuses it (a table swapped in and back within the one request is not seen). A read is not failed by a replica the check cannot reach or that has no table of that name: whether the read itself fails is decided, as before, by its own `skip_unavailable_shards` settings. Remote write, however, is refused (with a retryable `5xx`) while any replica is unreachable, has no table of that name, or does not show that table's `time_series` type, because a replica the check could not see would still receive the samples unchecked. When the `Distributed` table declares no database, each shard resolves the name in its own default database, except a shard that is this server itself, which is always read and written in-process (`prefer_localhost_replica` is pinned on for both, and parallel replicas off for the reads) and so resolves it in the requesting user's current database, exactly as any query here would. Reading through it needs `SELECT` on the `Distributed` table and `READ ON REMOTE`, because the query is rewritten into a `cluster()` call; both are checked before the shard-local check above runs, so a caller without either is refused with a plain access error rather than told what the shards hold. The `prometheusQuery`/`prometheusQueryRange` table functions need `CREATE TEMPORARY TABLE` on top of those, as they do over a `TimeSeries` table; the query endpoints name the selector inside the `cluster()` call for each shard to resolve, so they need it only for a shard that is this server itself, together with `SELECT` on that shard's table; both are checked before the shard-local check runs too. Writing needs `INSERT` on the `Distributed` table only.
+ 
+ Remote write into a `Distributed` target is an `INSERT` through that table's sink with [`distributed_foreground_insert`](/reference/settings/session-settings/distributed#distributed_foreground_insert) forced on and [`async_insert`](/reference/settings/session-settings/async-insert#async_insert) forced off, whatever the handler's user profile or the `remote_write` URL says: the samples are not queued on the initiator, by the sink or by the asynchronous insert queue, but delivered to the shards before the response, so a `204` means every shard (one replica per shard under `internal_replication`) has accepted them, and a shard that fails the insert fails the write with a retryable `5xx`, which Prometheus answers by resending the batch. A batch left in either queue would be flushed after the check above, into whatever answers to the shard-local name by then, which is why background delivery is not offered on this path. [`skip_unavailable_shards`](/reference/settings/session-settings/skip-unavailable-shards#skip_unavailable_shards) is forced off on this path too, whatever the URL or the profile says: a shard the sink skipped would be samples dropped under a `204`. The routing settings `insert_shard_id` and `insert_distributed_one_random_shard` are refused on this path, whether they come from the URL or from the profile: a batch goes where the table's sharding key sends it, so a `Distributed` table with several shards and no key cannot be written through remote write.
+ 
+diff --git a/src/Common/FailPoint.cpp b/src/Common/FailPoint.cpp
+index a95bf95beeb..7ee1139a4f4 100644
+--- a/src/Common/FailPoint.cpp
++++ b/src/Common/FailPoint.cpp
+@@ -47,6 +47,7 @@ static struct InitFiu
+     PAUSEABLE_ONCE(remote_query_executor_receive_packet_pause) \
+     PAUSEABLE_ONCE(remote_query_executor_finish_drain_pause) \
+     PAUSEABLE_ONCE(distributed_sink_pause_before_push) \
++    PAUSEABLE_ONCE(prometheus_remote_write_before_insert) \
+     ONCE(connection_stale_on_establish) \
+     REGULAR(cluster_discovery_faults) \
+     REGULAR(stripe_log_sink_write_fallpoint) \
+diff --git a/src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp b/src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp
+index bcb3aef1846..68a56d364eb 100644
+--- a/src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp
++++ b/src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp
+@@ -8,6 +8,7 @@
+ #include <Columns/ColumnDecimal.h>
+ #include <Columns/ColumnMap.h>
+ #include <Columns/ColumnTuple.h>
++#include <Common/FailPoint.h>
+ #include <Common/logger_useful.h>
+ #include <Common/saturatedDuration.h>
+ #include <Core/DecimalFunctions.h>
+@@ -52,6 +53,11 @@ namespace ErrorCodes
+     extern const int LOGICAL_ERROR;
+ }
+ 
++namespace FailPoints
++{
++    extern const char prometheus_remote_write_before_insert[];
++}
++
+ namespace
+ {
+ 
+@@ -342,11 +348,15 @@ void PrometheusRemoteWriteProtocol::write(
+ 
+     /// The sink would accept shard targets no prometheus read surface can answer from, and a caller's
+     /// own shard choice; checked here, not on construction, with no request body read in between.
+-    checkPrometheusQueryDistributedWrite(*time_series_storage, getContext());
++    const auto checked_targets = checkPrometheusQueryDistributedWrite(*time_series_storage, getContext());
+ 
+     auto metadata = time_series_storage->getInMemoryMetadataPtr(getContext(), false);
++    FailPointInjection::pauseFailPoint(FailPoints::prometheus_remote_write_before_insert);
+     insertBlock(makeBlock(time_series, metrics_metadata, *metadata), *time_series_storage, getContext());
+ 
++    /// The sink wrote by name: acknowledged only if every shard target is still the table checked above.
++    checkPrometheusQueryDistributedWriteDelivered(*time_series_storage, getContext(), checked_targets);
++
+     LOG_TRACE(
+         log,
+         "{}: {} time series and {} metrics metadata written",
+diff --git a/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp b/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp
+index fb23f41b221..e5ae19991fe 100644
+--- a/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp
++++ b/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp
+@@ -58,6 +58,7 @@ namespace ErrorCodes
+     extern const int BAD_ARGUMENTS;
+     extern const int NOT_IMPLEMENTED;
+     extern const int TYPE_MISMATCH;
++    extern const int UNKNOWN_STATUS_OF_INSERT;
+     extern const int UNEXPECTED_TABLE_ENGINE;
+ }
+ 
+@@ -129,13 +130,11 @@ namespace
+ 
+     /// Asks every replica itself, not one per shard as cluster() would, and afresh on every request: a verdict kept
+     /// for later would let a same-schema table swapped in under the name meanwhile take a write unchecked.
+-    void checkShardTargets(
+-        const IStorage & storage, const PrometheusQueryDistributedTarget & target, const ContextPtr & context, bool refuse_unavailable)
++    std::vector<PrometheusShardTargetIdentity>
++    probeShardTargets(const IStorage & storage, const PrometheusQueryDistributedTarget & target, const ContextPtr & context)
+     {
+         const auto & remote_id = target.remote_time_series_storage_id;
+         const auto cluster = typeid_cast<const StorageDistributed &>(storage).getCluster();
+-        const auto metadata = storage.getInMemoryMetadataPtr(context, false);
+-        const auto time_series_type = metadata->columns.get(TimeSeriesColumnNames::TimeSeries).type->getName();
+ 
+         /// An undeclared database is each replica's own default, except on a replica that is this server itself: the
+         /// read and the write pin prefer_localhost_replica on and parallel replicas off, so it runs on this context.
+@@ -147,62 +146,91 @@ namespace
+             const String table_predicate = quoteString(remote_id.table_name);
+             return "SELECT (SELECT engine FROM system.tables WHERE database = " + database_predicate + " AND name = " + table_predicate
+                 + ") AS engine, (SELECT type FROM system.columns WHERE database = " + database_predicate + " AND table = " + table_predicate
+-                + " AND name = " + quoteString(TimeSeriesColumnNames::TimeSeries) + ") AS ts_type";
++                + " AND name = " + quoteString(TimeSeriesColumnNames::TimeSeries) + ") AS ts_type"
++                + ", (SELECT toString(uuid) FROM system.tables WHERE database = " + database_predicate + " AND name = " + table_predicate
++                + ") AS uuid";
+         };
+         const auto nullable_string = std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>());
+-        const auto probe_header = std::make_shared<const Block>(Block{{nullable_string, "engine"}, {nullable_string, "ts_type"}});
++        const auto probe_header
++            = std::make_shared<const Block>(Block{{nullable_string, "engine"}, {nullable_string, "ts_type"}, {nullable_string, "uuid"}});
+ 
+         /// On the server's own context, and only ever after the caller's own grants are checked: a read
+         /// requires READ ON REMOTE above, so the probe reports nothing the caller's own cluster() could not.
+         auto probe_context = Context::createCopy(context->getGlobalContext());
+         probe_context->makeQueryContext();
+         probe_context->setCurrentQueryId("");
+-        /// An unreachable replica then answers nothing rather than failing the probe; judged below.
++        /// An unreachable replica then answers nothing rather than failing the probe; judged by the caller.
+         probe_context->setSetting("skip_unavailable_shards", true);
+ 
+-        UInt64 wrong_engine_replicas = 0;
+-        UInt64 wrong_type_replicas = 0;
+-        std::set<String> wrong_types;
+-        /// Unreachable, or without the table: the sink cannot use them either, and what answers to the name later is unchecked.
+-        Strings unavailable_replicas;
++        auto field_at = [](const Block & block, size_t position) -> String
++        {
++            const Field field = (*block.getByPosition(position).column)[0];
++            return field.isNull() ? "" : field.safeGet<String>();
++        };
++
++        std::vector<PrometheusShardTargetIdentity> identities;
+         for (const auto [shard_info, shard_addresses] : std::views::zip(cluster->getShardsInfo(), cluster->getShardsAddresses()))
+             for (const auto [pool, address] : std::views::zip(shard_info.per_replica_pools, shard_addresses))
+             {
++                auto & identity = identities.emplace_back();
++                identity.replica = pool->getAddress();
+                 RemoteQueryExecutor probe(pool, make_probe_query(address.is_local), probe_header, probe_context);
+-                bool answered = false;
+                 try
+                 {
+                     for (Block block = probe.readBlock(); !block.empty(); block = probe.readBlock())
+                     {
+                         block = convertBLOBColumns(block);
+-                        answered = true;
+-                        const Field engine = (*block.getByPosition(0).column)[0];
+-                        const Field ts_type = (*block.getByPosition(1).column)[0];
+-                        if (engine.isNull())
+-                            unavailable_replicas.push_back(
+-                                fmt::format("{} (no table {})", pool->getAddress(), backQuoteIfNeed(remote_id.table_name)));
+-                        else if (engine.safeGet<String>() != "TimeSeries")
+-                            ++wrong_engine_replicas;
+-                        /// Not exposed to the probe, or not there at all: the type went unchecked either way.
+-                        else if (ts_type.isNull())
+-                            unavailable_replicas.push_back(fmt::format(
+-                                "{} (no `{}` column on {})", pool->getAddress(), TimeSeriesColumnNames::TimeSeries,
+-                                backQuoteIfNeed(remote_id.table_name)));
+-                        else if (ts_type.safeGet<String>() != time_series_type)
+-                        {
+-                            ++wrong_type_replicas;
+-                            wrong_types.insert(ts_type.safeGet<String>());
+-                        }
++                        identity.answered = true;
++                        identity.engine = field_at(block, 0);
++                        identity.time_series_type = field_at(block, 1);
++                        identity.uuid = field_at(block, 2);
+                     }
+                 }
+                 catch (const NetException &)
+                 {
+                     /// A pooled connection to a replica that went away unnoticed fails on first use, not when handed out.
+-                    answered = false;
+                 }
+-                if (!answered)
+-                    unavailable_replicas.push_back(fmt::format("{} (unreachable)", pool->getAddress()));
+             }
++        return identities;
++    }
++
++    /// The verdict on what the probe found: a write refuses what a read leaves to its own shard-skip settings.
++    void checkShardTargets(
++        const IStorage & storage,
++        const PrometheusQueryDistributedTarget & target,
++        const ContextPtr & context,
++        const std::vector<PrometheusShardTargetIdentity> & identities,
++        bool refuse_unavailable)
++    {
++        const auto & remote_id = target.remote_time_series_storage_id;
++        const auto metadata = storage.getInMemoryMetadataPtr(context, false);
++        const auto time_series_type = metadata->columns.get(TimeSeriesColumnNames::TimeSeries).type->getName();
++
++        UInt64 wrong_engine_replicas = 0;
++        UInt64 wrong_type_replicas = 0;
++        std::set<String> wrong_types;
++        /// Unreachable, or without the table: the sink cannot use them either, and what answers to the name later is unchecked.
++        Strings unavailable_replicas;
++        for (const auto & identity : identities)
++        {
++            if (!identity.answered)
++                unavailable_replicas.push_back(fmt::format("{} (unreachable)", identity.replica));
++            else if (identity.engine.empty())
++                unavailable_replicas.push_back(
++                    fmt::format("{} (no table {})", identity.replica, backQuoteIfNeed(remote_id.table_name)));
++            else if (identity.engine != "TimeSeries")
++                ++wrong_engine_replicas;
++            /// Not exposed to the probe, or not there at all: the type went unchecked either way.
++            else if (identity.time_series_type.empty())
++                unavailable_replicas.push_back(fmt::format(
++                    "{} (no `{}` column on {})", identity.replica, TimeSeriesColumnNames::TimeSeries,
++                    backQuoteIfNeed(remote_id.table_name)));
++            else if (identity.time_series_type != time_series_type)
++            {
++                ++wrong_type_replicas;
++                wrong_types.insert(identity.time_series_type);
++            }
++        }
+ 
+         if (wrong_engine_replicas)
+             throw Exception(
+@@ -282,14 +310,14 @@ void checkPrometheusQueryDistributedRead(const IStorage & storage, const Context
+     }
+ 
+     /// Whether an unavailable replica fails the read is the read's own decision, as for any cluster() call.
+-    checkShardTargets(storage, *target, context, /* refuse_unavailable = */ false);
++    checkShardTargets(storage, *target, context, probeShardTargets(storage, *target, context), /* refuse_unavailable = */ false);
+ }
+ 
+-void checkPrometheusQueryDistributedWrite(const IStorage & storage, const ContextPtr & context)
++std::vector<PrometheusShardTargetIdentity> checkPrometheusQueryDistributedWrite(const IStorage & storage, const ContextPtr & context)
+ {
+     const auto target = resolvePrometheusQueryTarget(storage);
+     if (!target)
+-        return;
++        return {};
+ 
+     /// The sink honours both as for any INSERT (the second only without a key); here a batch goes where the key sends it or nowhere.
+     const auto & settings = context->getSettingsRef();
+@@ -300,7 +328,46 @@ void checkPrometheusQueryDistributedWrite(const IStorage & storage, const Contex
+             "samples are routed by the table's sharding key alone",
+             storage.getStorageID().getNameForLogs());
+ 
+-    checkShardTargets(storage, *target, context, /* refuse_unavailable = */ true);
++    auto targets = probeShardTargets(storage, *target, context);
++    checkShardTargets(storage, *target, context, targets, /* refuse_unavailable = */ true);
++    return targets;
++}
++
++void checkPrometheusQueryDistributedWriteDelivered(
++    const IStorage & storage, const ContextPtr & context, const std::vector<PrometheusShardTargetIdentity> & checked_targets)
++{
++    const auto target = resolvePrometheusQueryTarget(storage);
++    if (!target)
++        return;
++
++    std::vector<PrometheusShardTargetIdentity> delivered_to;
++    try
++    {
++        delivered_to = probeShardTargets(storage, *target, context);
++    }
++    catch (...)
++    {
++        /// Delivered but not witnessed: the status is unknown, which must stay retryable rather than become a 4xx.
++        throw Exception(
++            ErrorCodes::UNKNOWN_STATUS_OF_INSERT,
++            "Remote write over table {} is not acknowledged: its targets could not be checked again ({}): retry",
++            storage.getStorageID().getNameForLogs(), getCurrentExceptionMessage(false));
++    }
++
++    Strings changed_replicas;
++    for (const auto [checked, delivered] : std::views::zip(checked_targets, delivered_to))
++        if (delivered != checked)
++            changed_replicas.push_back(checked.replica);
++    if (delivered_to.size() != checked_targets.size())
++        changed_replicas.push_back("every replica (the cluster changed)");
++    if (changed_replicas.empty())
++        return;
++
++    throw Exception(
++        ErrorCodes::UNKNOWN_STATUS_OF_INSERT,
++        "Remote write over table {} is not acknowledged: its target named {} changed on {} while the samples were delivered: retry",
++        storage.getStorageID().getNameForLogs(), backQuoteIfNeed(target->remote_time_series_storage_id.table_name),
++        fmt::join(changed_replicas, ", "));
+ }
+ 
+ }
+diff --git a/src/Storages/TimeSeries/resolvePrometheusQueryTarget.h b/src/Storages/TimeSeries/resolvePrometheusQueryTarget.h
+index 29d4066952b..94b10dd6061 100644
+--- a/src/Storages/TimeSeries/resolvePrometheusQueryTarget.h
++++ b/src/Storages/TimeSeries/resolvePrometheusQueryTarget.h
+@@ -5,6 +5,7 @@
+ 
+ #include <optional>
+ #include <string_view>
++#include <vector>
+ 
+ 
+ namespace DB
+@@ -38,8 +39,25 @@ void checkNoBypassedReadRestriction(
+ /// all before the probe; then every replica's target must be a TimeSeries table of the wrapper's `time_series` type.
+ void checkPrometheusQueryDistributedRead(const IStorage & storage, const ContextPtr & context);
+ 
++/// What one replica said the table the wrapper names on it is: nothing when unreachable, and each field
++/// empty when the replica has no such table or does not expose its `time_series` column.
++struct PrometheusShardTargetIdentity
++{
++    String replica;
++    bool answered = false;
++    String engine;
++    String time_series_type;
++    String uuid;
++    bool operator==(const PrometheusShardTargetIdentity &) const = default;
++};
++
+ /// The same probe for a write, which also refuses an unreachable replica or a missing table or type (it would take
+ /// samples unchecked) and insert_shard_id / insert_distributed_one_random_shard: the sharding key alone routes a batch.
+-void checkPrometheusQueryDistributedWrite(const IStorage & storage, const ContextPtr & context);
++std::vector<PrometheusShardTargetIdentity> checkPrometheusQueryDistributedWrite(const IStorage & storage, const ContextPtr & context);
++
++/// The sink writes by name, so a batch is acknowledged only once every replica still holds the target checked: one
++/// swapped meanwhile leaves the write's status unknown, a retryable error that has Prometheus resend the batch.
++void checkPrometheusQueryDistributedWriteDelivered(
++    const IStorage & storage, const ContextPtr & context, const std::vector<PrometheusShardTargetIdentity> & checked_targets);
+ 
+ }
+diff --git a/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py b/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py
+index c40b6ca04f4..e69f530cf1e 100644
+--- a/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py
++++ b/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py
+@@ -2,6 +2,7 @@
+ on the caller's context, where an undeclared database is the caller's own: the probe must check that table.
+ """
+ 
++import concurrent.futures
+ import json
+ 
+ import pytest
+@@ -32,6 +33,8 @@ node = cluster.add_instance(
+ )
+ 
+ START_TIME = 1724112000
++# Pauses a remote write between its shard-target check and its INSERT.
++BEFORE_INSERT = "prometheus_remote_write_before_insert"
+ 
+ # The probe's own connection authenticates as `default`, whose current database is `default`;
+ # this caller's is `metrics`, and that is where its writes and reads land.
+@@ -240,3 +243,43 @@ def test_reads_keep_the_local_shard_in_process_whatever_the_caller_fans_out(
+     # And the grants of that in-process read are still asked for first.
+     denied = query_as("query", NO_SHARD_SELECT_USER, settings)
+     assert_denied_without_leaking(denied, "SELECT ON default.ts_local")
++
++
++def test_remote_write_refuses_a_local_shard_target_swapped_after_the_check():
++    """The local shard is written in-process by name, and witnessed like any other: a same-schema
++    MergeTree table swapped in under the name meanwhile takes the batch, which is not acknowledged.
++    """
++    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
++    swapped = False
++    try:
++        node.query(f"SYSTEM ENABLE FAILPOINT {BEFORE_INSERT}")
++        pending = pool.submit(
++            get_response_to_remote_write,
++            node.ip_address,
++            9093,
++            f"/local/write{CALLER}",
++            one_sample("held_metric"),
++        )
++        node.query(f"SYSTEM WAIT FAILPOINT {BEFORE_INSERT} PAUSE", timeout=60)
++        node.query("EXCHANGE TABLES metrics.ts_local AND metrics.ts_swap")
++        swapped = True
++        node.query(f"SYSTEM NOTIFY FAILPOINT {BEFORE_INSERT}")
++        response = pending.result(timeout=60)
++        assert response.status_code >= 500, response.text
++        assert "UNKNOWN_STATUS_OF_INSERT" in response.text
++        assert "is not acknowledged" in response.text
++    finally:
++        node.query(f"SYSTEM DISABLE FAILPOINT {BEFORE_INSERT}")
++        pool.shutdown(wait=True)
++        if swapped:
++            node.query("EXCHANGE TABLES metrics.ts_local AND metrics.ts_swap")
++        # The MergeTree table took the batch under the TimeSeries name; emptied so the pair is as created.
++        node.query("TRUNCATE TABLE metrics.ts_swap")
++
++    # Nothing reached the TimeSeries table, and the retry lands once the name is right again.
++    count = "SELECT count() FROM timeSeriesTags(metrics.ts_local) WHERE metric_name = 'held_metric'"
++    assert int(node.query(count)) == 0
++    send_protobuf_to_remote_write(
++        node.ip_address, 9093, f"/local/write{CALLER}", one_sample("held_metric")
++    )
++    assert_eq_with_retry(node, count, "1")
+diff --git a/tests/integration/test_prometheus_protocols/test_write_distributed.py b/tests/integration/test_prometheus_protocols/test_write_distributed.py
+index a6b514b884f..5a192375c47 100644
+--- a/tests/integration/test_prometheus_protocols/test_write_distributed.py
++++ b/tests/integration/test_prometheus_protocols/test_write_distributed.py
+@@ -1,3 +1,5 @@
++import concurrent.futures
++
+ import pytest
+ 
+ from helpers.cluster import ClickHouseCluster
+@@ -21,6 +23,8 @@ node = cluster.add_instance(
+ )
+ 
+ START_TIME = 1724112000
++# Pauses a remote write between its shard-target check and its INSERT.
++BEFORE_INSERT = "prometheus_remote_write_before_insert"
+ # Eight fixed hosts: the sharding hash is stable, so the split across the two shards is the same
+ # on every run, and with eight distinct keys both shards receive rows.
+ HOSTS = [f"h{i}" for i in range(8)]
+@@ -207,3 +211,35 @@ def test_remote_write_refuses_one_random_shard_on_a_keyless_wrapper():
+         in response.text
+     )
+     assert count_on_the_shards("prom_dist_keyless", "random_metric") == 0
++
++
++def test_remote_write_refuses_a_shard_target_swapped_after_the_check():
++    """A same-schema MergeTree table swapped in under a shard-local name between the check and the
++    INSERT takes the batch unchecked: the write is not acknowledged, so Prometheus retries it.
++    """
++    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
++    swapped = False
++    try:
++        node.query(f"SYSTEM ENABLE FAILPOINT {BEFORE_INSERT}")
++        # `h3` hashes to shard_0: the whole batch goes to the shard whose target is swapped meanwhile.
++        pending = pool.submit(write, "/dist/write", "swapped_metric", ("h3",))
++        node.query(f"SYSTEM WAIT FAILPOINT {BEFORE_INSERT} PAUSE", timeout=60)
++        node.query("EXCHANGE TABLES shard_0.ts_local AND shard_0.mt_bad")
++        swapped = True
++        node.query(f"SYSTEM NOTIFY FAILPOINT {BEFORE_INSERT}")
++        response = pending.result(timeout=60)
++        assert response.status_code >= 500, response.text
++        assert "UNKNOWN_STATUS_OF_INSERT" in response.text
++        assert "is not acknowledged" in response.text
++    finally:
++        node.query(f"SYSTEM DISABLE FAILPOINT {BEFORE_INSERT}")
++        pool.shutdown(wait=True)
++        if swapped:
++            node.query("EXCHANGE TABLES shard_0.ts_local AND shard_0.mt_bad")
++        # The decoy took the batch under the TimeSeries name; the module's other tests expect it empty.
++        node.query("TRUNCATE TABLE shard_0.mt_bad")
++
++    # Nothing reached a TimeSeries table, and the retry lands once the name is right again.
++    assert count_on_the_shards("prom_dist", "swapped_metric") == 0
++    assert write("/dist/write", "swapped_metric", ("h3",)).status_code == 204
++    assert count_on_the_shards("prom_dist", "swapped_metric") == 1
+-- 
+2.43.0
+
