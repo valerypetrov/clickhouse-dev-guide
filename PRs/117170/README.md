@@ -185,6 +185,16 @@ Verification: two adversarial review passes. The first settled the design (the `
 
 Master had moved again while this was being written, and the branch owner merged it in as `e993b53a6b5`; this commit is rebased on top of that.
 
+### Round 5b: master merged again, and the stateless test's self-insert deadlock
+
+Master had moved 605 commits on, with one conflict, in `SettingsChangesHistory.cpp`, where master added two entries next to the two this PR adds. Both sides kept, master's first (merge `e7c4b2b82d0`).
+
+Worth knowing from that merge: master moved the `TimeSeries` engine and the `promql` dialect to the **private preview tier**, renaming `allow_experimental_time_series_table` to `enable_time_series_table`. It is `DECLARE_WITH_ALIAS`, so the old name still works and the PR's test configs need no change; the sources are all still in the tree.
+
+CI on `a1d75e87b11` failed one test, the PR's own `05099_insert_expected_table_engine`, and not on an assertion: Fast test killed it on a timeout, with the client blocked in `receiveEndOfQueryForInsert`. The cause was the one statement the test's author had flagged as the newest path. Its single *successful* `INSERT` over a connection targeted the table carrying three materialized views, one of which pushes into another `Distributed` table over this same server with foreground insert on, so the shard opened a second connection back to itself while the first was still delivering. That case exists only to prove the shard reads both requirements back off the wire, which needs no views at all, so it now goes to a `Distributed` table over a table that has none; the view chain keeps the cases that reach a shard in-process (commit `ef17cfdfb25`, patch 0011). The earlier, passing version of this test had only a *failing* insert over a connection, which never reaches the views, which is why the shape only broke when a passing one was added.
+
+The lesson for this repo's tests: an `INSERT` over a `Distributed` table pointing at this same server is fine, and so is a materialized view onto another such table, but composing the two on a statement that succeeds nests self-connections and can deadlock a single-server test.
+
 ## 2. The AST fuzzer failure is not this PR's
 
 What the bot links: `Not-ready Set is passed as the second argument for function 'A (STID: 0250-4e52)` → issue #117806. That link is by normalized message only (the STID replaces every identifier with `A`, so every `Not-ready Set` error shares it). Issue #117806 was an object-storage `_path GLOBAL IN` query, closed as a duplicate fixed by PR #112968 (merged Sep 3, after this branch's last merge of master on Sep 2). The failure on this PR is a different shape:
@@ -224,7 +234,7 @@ Suggested stand-down comment for the PR:
 
 ## 3. What is in this directory and how to use it
 
-All ten patches below were pushed to the PR branch `valerypetrov/ClickHouse:promql-over-distributed` (`a7a3a2501`, the round-2 follow-up `3c20def968ed6690c862b811f2b276e32fb6643e`, the comment-only `687057e62`, after the master merge `f49502b` the simplification `3000468a377` plus its assertion-message follow-up, and after the second merge `ad5ec290192` the round-3 witness `e5fe445b401` the fix that supersedes it, `4dbe1d113ec`, the round-4 local-replica fix `ed72d28924d`, its context-lifetime follow-up `d7617c6c3ac`, and the round-5 fixes `a1d75e87b11`), so PR 117170 already carries them; the files are kept here as the record. The stand-down comment in section 2 still has to be posted on the PR by hand.
+All eleven patches below were pushed to the PR branch `valerypetrov/ClickHouse:promql-over-distributed` (`a7a3a2501`, the round-2 follow-up `3c20def968ed6690c862b811f2b276e32fb6643e`, the comment-only `687057e62`, after the master merge `f49502b` the simplification `3000468a377` plus its assertion-message follow-up, and after the second merge `ad5ec290192` the round-3 witness `e5fe445b401` the fix that supersedes it, `4dbe1d113ec`, the round-4 local-replica fix `ed72d28924d`, its context-lifetime follow-up `d7617c6c3ac`, the round-5 fixes `a1d75e87b11`, and after the third master merge `e7c4b2b82d0` the stateless-test fix `ef17cfdfb25`), so PR 117170 already carries them; the files are kept here as the record. The stand-down comment in section 2 still has to be posted on the PR by hand.
 
 - `0001-Check-the-local-shard-s-own-grants-before-the-promet.patch`: the grant pre-check, on top of `e1ae54c`. Files: `src/Storages/TimeSeries/resolvePrometheusQueryTarget.{cpp,h}`, `docs/concepts/features/interfaces/prometheus.mdx`, `tests/integration/test_prometheus_protocols/test_local_shard_distributed.py`.
 - `0003-Name-the-pin-where-the-shard-probe-and-the-grant-pre.patch`: comment-only; names the pin at the two assumption points in `resolvePrometheusQueryTarget.cpp`.
@@ -235,6 +245,7 @@ All ten patches below were pushed to the PR branch `valerypetrov/ClickHouse:prom
 - `0008-Check-a-shard-that-is-this-server-itself-on-the-call.patch`: the round-4 fix, the local replica checked in-process on the caller's context, plus the `setSetting` ambiguity CI fix. Files: `src/Interpreters/InterpreterInsertQuery.cpp`, `src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp`, `src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp`, the docs, `tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml`, `configs/prometheus_local_shard.xml` and `test_local_shard_distributed.py`.
 - `0009-Keep-the-local-shard-s-context-copy-alive-for-the-in.patch`: the one-line context-lifetime fix in `src/Storages/Distributed/DistributedSink.cpp`.
 - `0010-Refuse-a-shard-target-of-another-TimeSeries-type-and.patch`: the round-5 fixes, `insert_expected_column_types` and the `SHOW CREATE`/`DESC` probe. Files: `src/Core/Settings.cpp`, `src/Core/SettingsChangesHistory.cpp`, `src/Interpreters/InterpreterInsertQuery.cpp`, `src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp`, `src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp`, the docs, the stateless test and three integration files.
+- `0011-Keep-the-setting-s-stateless-test-off-the-nested-sel.patch`: the stateless test moved off the nested self-insert that timed out, on top of the third master merge.
 - `0002-Pin-a-shard-that-is-this-server-itself-to-the-in-pro.patch`: the round-2 pin, on top of the first. Files: `src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp`, `src/Storages/StoragePrometheusQuery.cpp`, `src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp`, `src/Storages/TimeSeries/resolvePrometheusQueryTarget.{cpp,h}`, the docs, `tests/integration/test_prometheus_protocols/configs/config.d/local_shard_dist.xml` and the test module.
 
 ```sh
