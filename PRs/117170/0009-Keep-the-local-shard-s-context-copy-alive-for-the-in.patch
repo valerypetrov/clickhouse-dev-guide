@@ -1,0 +1,40 @@
+From d7617c6c3ace88fbe43083c0cbecd055e8e88169 Mon Sep 17 00:00:00 2001
+From: Valery Petrov <valerypetrov@icloud.com>
+Date: Tue, 8 Sep 2026 00:03:07 +0000
+Subject: [PATCH] Keep the local shard's context copy alive for the insert that
+ uses it
+
+InterpreterInsertQuery keeps only a weak reference to its context, so the
+context copy the background sink's local write was given died as the
+temporary it was, and every distributed insert taking that path failed with
+"Context has expired" (18 stateless tests). The copy is now a named local
+that outlives the interpreter and its pipeline.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016i1XnLC3KypZdaYYsfzqub
+---
+ src/Storages/Distributed/DistributedSink.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/Storages/Distributed/DistributedSink.cpp b/src/Storages/Distributed/DistributedSink.cpp
+index d15c1f5b5d1..dc779003a5b 100644
+--- a/src/Storages/Distributed/DistributedSink.cpp
++++ b/src/Storages/Distributed/DistributedSink.cpp
+@@ -868,10 +868,12 @@ void DistributedSink::writeToLocal(const Cluster::ShardInfo & shard_info, const
+ 
+     try
+     {
+-        /// Its own copy, as a foreground job takes: the interpreter consumes insert_expected_table_engine on it.
++        /// Its own copy, as a foreground job takes: the interpreter consumes insert_expected_table_engine on it,
++        /// and it must outlive the interpreter, which keeps only a weak reference to its context.
++        auto local_context = Context::createCopy(context);
+         InterpreterInsertQuery interp(
+             query_ast,
+-            Context::createCopy(context),
++            local_context,
+             allow_materialized,
+             /* no_squash= */ false,
+             /* no_destination= */ false,
+-- 
+2.43.0
+
