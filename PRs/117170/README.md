@@ -216,6 +216,16 @@ Until now only Fast test, Style check and the builds had run on most commits. Th
 - `error_code` lost its `node` argument at one call site when it was factored into `prometheus_test_utils.py` during the simplification pass. `test_remote_read_needs_the_select_grant` has been failing with `TypeError` on every full-suite run since `5fd7193e17`, invisible because the suite had not run since.
 - The round-4 test asserted that a cluster user granted nothing is *denied* `system.tables`. It is not: `ContextAccess` grants every user implicit `SELECT` on it and the table filters the rows it shows, so the query returns 0 rather than raising. Round 5's own investigation had established exactly this and the round-5 test was written correctly against it; the round-4 test was never corrected. It now asserts the count is zero, which is the real premise.
 
+### Round 6c: the two jobs still red are not this PR's
+
+On `0fd7979367d` the previous round's four fixes all pass and the round-6 test passes with them: 115 jobs green, including every stateless, integration, build and unit job. Two are not, and neither is this PR's.
+
+**Stress test (arm_release)** could not restart the server: `Cannot attach table test_7.d__fuzz_4 ... ENGINE = S3('...', 'NOSIGN', 'CSV', partition_strategy = 'none', headers('foo' = ...)) ... Expected positional arguments to go before key-value arguments (BAD_ARGUMENTS)`. The stress test's fuzzer created an S3 table whose argument order the engine accepts at `CREATE` and rejects at `ATTACH`, so the table's metadata cannot be reloaded and startup fails. The round trip is asymmetric in `src/Storages/ObjectStorage/S3/Configuration.cpp` and `Utils.cpp`, neither of which this PR touches. The CI database has the same signature on PRs 117551 (Sep 1) and 99026 (Sep 4), both unrelated, so it is a pre-existing intermittent master bug that the fuzzer reaches when it happens to emit that argument order. No fix for it exists in master to port.
+
+**AST fuzzer (amd_release, oracle)** ended with `Fuzzer exited with timeout`, which is not a crash or an assertion. Over the last seven days that line appears 1147 times on master itself and 49 to 68 times on each of a dozen other PRs; this PR has 55, squarely in the middle. It carries no signal.
+
+Nothing was pushed for either: there is no change to this PR that would affect them, and inventing one would only obscure the real state. Master is 67 commits ahead and still merges cleanly.
+
 ## 2. The AST fuzzer failure is not this PR's
 
 What the bot links: `Not-ready Set is passed as the second argument for function 'A (STID: 0250-4e52)` → issue #117806. That link is by normalized message only (the STID replaces every identifier with `A`, so every `Not-ready Set` error shares it). Issue #117806 was an object-storage `_path GLOBAL IN` query, closed as a duplicate fixed by PR #112968 (merged Sep 3, after this branch's last merge of master on Sep 2). The failure on this PR is a different shape:
