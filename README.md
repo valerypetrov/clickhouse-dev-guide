@@ -14,6 +14,7 @@ A practical collection of English-language notes for understanding, building, te
 - [Run integration tests](Tests/integration_test.md)
 - [Read CI results](CI/How-to-read-CI-result.md)
 - [PR 117170: acting on clickhouse-gh bot findings (fuzzer triage, an access-ordering fix, and a remote-write acknowledgement fix)](PRs/117170/README.md)
+- [PR 115724: proving an interrupted S3Queue move's retry reports no false collision](PRs/115724/README.md)
 
 ### Core query engine and analyzer (Query Pipeline 2.0)
 
