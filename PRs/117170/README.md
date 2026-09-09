@@ -224,7 +224,9 @@ On `0fd7979367d` the previous round's four fixes all pass and the round-6 test p
 
 **AST fuzzer (amd_release, oracle)** ended with `Fuzzer exited with timeout`, which is not a crash or an assertion. Over the last seven days that line appears 1147 times on master itself and 49 to 68 times on each of a dozen other PRs; this PR has 55, squarely in the middle. It carries no signal.
 
-Nothing was pushed for either: there is no change to this PR that would affect them, and inventing one would only obscure the real state. Master is 67 commits ahead and still merges cleanly.
+Nothing was pushed for either: there is no change to this PR that would affect them, and inventing one would only obscure the real state.
+
+Master then moved 108 commits on and conflicted once more, in the same place every merge on this branch has: the 26.9 block of `SettingsChangesHistory.cpp`, where master added three query-plan settings beside the two this PR adds. Both sides kept, master's first (merge `ba50525bd73`). Master's new PromQL range functions, `max_over_time`, `min_over_time` and the two `ts_of_*` ones, merged into the table function's docs on their own.
 
 ## 2. The AST fuzzer failure is not this PR's
 
