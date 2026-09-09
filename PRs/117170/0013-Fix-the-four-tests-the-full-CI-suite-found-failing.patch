@@ -1,0 +1,174 @@
+From 0fd7979367d9525072ea98c896e519f8c95a960c Mon Sep 17 00:00:00 2001
+From: Valery Petrov <valerypetrov@icloud.com>
+Date: Wed, 9 Sep 2026 04:49:33 +0000
+Subject: [PATCH] Fix the four tests the full CI suite found failing
+
+The suite ran everything for the first time in several rounds and turned up
+four failures, three of them the PR's own.
+
+A missing shard table was reported as an unreachable replica rather than a
+missing one: SHOW CREATE TABLE answers a name it cannot produce a DDL for
+with CANNOT_GET_CREATE_TABLE_QUERY, not UNKNOWN_TABLE, so the probe's mapping
+missed it and the write's refusal lost the diagnosis it is asserted to carry.
+
+The stateless test of the new setting deadlocked under the randomized
+settings the flaky and targeted jobs use. It had two views on one table, one
+writing a Log table directly and one writing that same Log table again over a
+Distributed table pointing back at this server, so the second waited on the
+lock the first held for the whole statement. The nested hop only proved that
+the requirement a table consumed does not travel a further Distributed hop,
+which the view target of another type already proves without one.
+
+Two assertions rested on premises that are not true. `error_code` lost its
+`node` argument at one call site when it was factored out in the
+simplification pass, which the integration suite has been failing on since.
+And a cluster user granted nothing is not denied `system.tables`: every user
+may read it and it filters the rows it shows, so the premise is that it shows
+that user no row, not that it raises.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016i1XnLC3KypZdaYYsfzqub
+---
+ .../TimeSeries/resolvePrometheusQueryTarget.cpp   | 10 ++++++----
+ .../test_access_distributed.py                    |  2 +-
+ .../test_local_shard_distributed.py               |  7 ++++---
+ .../05099_insert_expected_table_engine.reference  |  5 -----
+ .../05099_insert_expected_table_engine.sql        | 15 ++++-----------
+ 5 files changed, 15 insertions(+), 24 deletions(-)
+
+diff --git a/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp b/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp
+index cc377c4a279..3a882d769b5 100644
+--- a/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp
++++ b/src/Storages/TimeSeries/resolvePrometheusQueryTarget.cpp
+@@ -59,6 +59,7 @@ namespace ErrorCodes
+     extern const int ACCESS_DENIED;
+     extern const int ALL_CONNECTION_TRIES_FAILED;
+     extern const int BAD_ARGUMENTS;
++    extern const int CANNOT_GET_CREATE_TABLE_QUERY;
+     extern const int INCOMPATIBLE_SCHEMA;
+     extern const int NOT_IMPLEMENTED;
+     extern const int TYPE_MISMATCH;
+@@ -264,10 +265,11 @@ namespace
+                     /// a replica that may not answer here is left to the check its own insert makes on its target.
+                     if (e.code() == ErrorCodes::ACCESS_DENIED)
+                         continue;
+-                    /// Anything else the replica could not answer leaves its target unverified, as an unreachable one is.
+-                    unavailable = e.code() == ErrorCodes::UNKNOWN_TABLE || e.code() == ErrorCodes::UNKNOWN_DATABASE
+-                        ? fmt::format("no table {}", backQuoteIfNeed(remote_id.table_name))
+-                        : "unreachable";
++                    /// SHOW CREATE TABLE reports a name it cannot produce a DDL for as its own code, DESC as
++                    /// the plain one; anything else leaves the target unverified, as an unreachable replica does.
++                    const bool no_table = e.code() == ErrorCodes::CANNOT_GET_CREATE_TABLE_QUERY
++                        || e.code() == ErrorCodes::UNKNOWN_TABLE || e.code() == ErrorCodes::UNKNOWN_DATABASE;
++                    unavailable = no_table ? fmt::format("no table {}", backQuoteIfNeed(remote_id.table_name)) : "unreachable";
+                 }
+                 /// A connection the pool could not open is skipped rather than raised, so it answers nothing.
+                 if (unavailable.empty() && !answered)
+diff --git a/tests/integration/test_prometheus_protocols/test_access_distributed.py b/tests/integration/test_prometheus_protocols/test_access_distributed.py
+index 5bb75934e54..631d23c1d1d 100644
+--- a/tests/integration/test_prometheus_protocols/test_access_distributed.py
++++ b/tests/integration/test_prometheus_protocols/test_access_distributed.py
+@@ -199,7 +199,7 @@ def test_remote_read_needs_the_select_grant():
+         node.ip_address, 9093, f"{DIST}/read", read_request
+     )
+     assert allowed.headers["X-ClickHouse-Exception-Code"] == error_code(
+-        "NOT_IMPLEMENTED"
++        node, "NOT_IMPLEMENTED"
+     )
+ 
+     # The restricted caller is stopped before that, so the refusal never reaches it.
+diff --git a/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py b/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py
+index 4701d0a2b00..50f0f189262 100644
+--- a/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py
++++ b/tests/integration/test_prometheus_protocols/test_local_shard_distributed.py
+@@ -261,12 +261,13 @@ def test_local_shard_is_checked_on_the_callers_context_not_the_cluster_users():
+     """A shard that is this server itself is checked, written and read on the caller's context: the
+     credentials of its cluster entry play no part, and here they hold no grant at all.
+     """
+-    # The premise: as the cluster user, the old probe's SELECT from system.tables was denied.
+-    denied = node.query_and_get_error(
++    # The premise: the cluster user is granted nothing, so the table the old probe selected from
++    # shows it no row of `metrics` (system.tables is readable by all and filters what it shows).
++    hidden = node.query(
+         "SELECT count() FROM system.tables WHERE database = 'metrics'",
+         user=CLUSTER_NOBODY,
+     )
+-    assert "Not enough privileges" in denied, denied
++    assert hidden.strip() == "0", hidden
+ 
+     send_protobuf_to_remote_write(
+         node.ip_address,
+diff --git a/tests/queries/0_stateless/05099_insert_expected_table_engine.reference b/tests/queries/0_stateless/05099_insert_expected_table_engine.reference
+index f9b1e90f3b6..a66eb1b949c 100644
+--- a/tests/queries/0_stateless/05099_insert_expected_table_engine.reference
++++ b/tests/queries/0_stateless/05099_insert_expected_table_engine.reference
+@@ -4,14 +4,9 @@
+ 7
+ 9
+ 1
+-1
+-3
+ 3
+ 6
+-6
+ 7
+-7
+-9
+ 9
+ 1
+ 3
+diff --git a/tests/queries/0_stateless/05099_insert_expected_table_engine.sql b/tests/queries/0_stateless/05099_insert_expected_table_engine.sql
+index c4bf291ecc9..6a7d91b0290 100644
+--- a/tests/queries/0_stateless/05099_insert_expected_table_engine.sql
++++ b/tests/queries/0_stateless/05099_insert_expected_table_engine.sql
+@@ -4,8 +4,6 @@ DROP TABLE IF EXISTS insert_expected_engine_wide;
+ DROP TABLE IF EXISTS insert_expected_engine_mv;
+ DROP TABLE IF EXISTS insert_expected_engine_mv_wide;
+ DROP TABLE IF EXISTS insert_expected_engine_dist;
+-DROP TABLE IF EXISTS insert_expected_engine_log_dist;
+-DROP TABLE IF EXISTS insert_expected_engine_mv_dist;
+ DROP TABLE IF EXISTS insert_expected_engine_plain;
+ DROP TABLE IF EXISTS insert_expected_engine_plain_dist;
+ 
+@@ -16,25 +14,22 @@ CREATE TABLE insert_expected_engine_wide (x UInt16) ENGINE = Log;
+ CREATE MATERIALIZED VIEW insert_expected_engine_mv TO insert_expected_engine_log AS SELECT x FROM insert_expected_engine;
+ CREATE MATERIALIZED VIEW insert_expected_engine_mv_wide TO insert_expected_engine_wide AS SELECT toUInt16(x) AS x FROM insert_expected_engine;
+ CREATE TABLE insert_expected_engine_dist AS insert_expected_engine ENGINE = Distributed(test_shard_localhost, currentDatabase(), insert_expected_engine);
+--- A view onto a Distributed table: the requirement the named table consumed must not reach that shard.
+-CREATE TABLE insert_expected_engine_log_dist AS insert_expected_engine_log ENGINE = Distributed(test_shard_localhost, currentDatabase(), insert_expected_engine_log);
+-CREATE MATERIALIZED VIEW insert_expected_engine_mv_dist TO insert_expected_engine_log_dist AS SELECT x FROM insert_expected_engine;
+ -- No view of its own: what the shard resolves over the connection is checked without a second hop from it.
+ CREATE TABLE insert_expected_engine_plain (x UInt8) ENGINE = Memory;
+ CREATE TABLE insert_expected_engine_plain_dist AS insert_expected_engine_plain ENGINE = Distributed(test_shard_localhost, currentDatabase(), insert_expected_engine_plain);
+ 
+--- The table named is checked; the views' Log targets are its own writes and are not, even through a Distributed table.
+-INSERT INTO insert_expected_engine SETTINGS insert_expected_table_engine = 'Memory', distributed_foreground_insert = 1 VALUES (1);
++-- The table named is checked; the views' targets are its own writes and are not.
++INSERT INTO insert_expected_engine SETTINGS insert_expected_table_engine = 'Memory' VALUES (1);
+ INSERT INTO insert_expected_engine SETTINGS insert_expected_table_engine = 'TimeSeries' VALUES (2); -- { serverError UNEXPECTED_TABLE_ENGINE }
+ 
+ -- The types the table declares are checked and consumed the same way: the view target declaring `x` as
+ -- UInt16 is never asked for the type the named table matched.
+-INSERT INTO insert_expected_engine SETTINGS insert_expected_column_types = {'x': 'UInt8'}, distributed_foreground_insert = 1 VALUES (3);
++INSERT INTO insert_expected_engine SETTINGS insert_expected_column_types = {'x': 'UInt8'} VALUES (3);
+ INSERT INTO insert_expected_engine SETTINGS insert_expected_column_types = {'x': 'UInt16'} VALUES (4); -- { serverError INCOMPATIBLE_SCHEMA }
+ -- A column the table does not declare at all.
+ INSERT INTO insert_expected_engine SETTINGS insert_expected_column_types = {'y': 'UInt8'} VALUES (5); -- { serverError INCOMPATIBLE_SCHEMA }
+ -- Both requirements on one INSERT.
+-INSERT INTO insert_expected_engine SETTINGS insert_expected_table_engine = 'Memory', insert_expected_column_types = {'x': 'UInt8'}, distributed_foreground_insert = 1 VALUES (6);
++INSERT INTO insert_expected_engine SETTINGS insert_expected_table_engine = 'Memory', insert_expected_column_types = {'x': 'UInt8'} VALUES (6);
+ 
+ -- A Distributed table forwards both instead of checking itself, to a shard that is this server itself.
+ INSERT INTO insert_expected_engine_dist SETTINGS insert_expected_table_engine = 'Memory', distributed_foreground_insert = 1 VALUES (7);
+@@ -55,8 +50,6 @@ SELECT * FROM insert_expected_engine_plain ORDER BY x;
+ 
+ DROP TABLE insert_expected_engine_plain_dist;
+ DROP TABLE insert_expected_engine_plain;
+-DROP TABLE insert_expected_engine_mv_dist;
+-DROP TABLE insert_expected_engine_log_dist;
+ DROP TABLE insert_expected_engine_dist;
+ DROP TABLE insert_expected_engine_mv_wide;
+ DROP TABLE insert_expected_engine_mv;
+-- 
+2.43.0
+
