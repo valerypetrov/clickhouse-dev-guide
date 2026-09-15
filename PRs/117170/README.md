@@ -254,6 +254,29 @@ A third test was written and then removed, and the reason is worth keeping. It a
 
 Left alone, and worth noting: `/api/v1/metadata` is now the only Prometheus HTTP endpoint that still needs `CREATE TEMPORARY TABLE`, because it names `timeSeriesMetrics`, which stays non-readonly. It refuses a `Distributed` target outright (`checkMetadataEndpointTarget`), so no cluster user is ever involved and the reported bug is not reopened. Making the three `timeSeriesTags`/`timeSeriesData`/`timeSeriesMetrics` functions readonly too is a wider change than this review asked for: unlike the selector they check no grant of their own on the outer table, relying on the inner tables' own `SELECT`.
 
+### Round 9: the metadata Major was already fixed, and master renamed the outer column
+
+The review re-posted the round-7 Major verbatim, citing `src/Storages/TimeSeries/PrometheusRemoteWriteProtocol.cpp:360-362`. It is stale, and the citation proves it. At `ebe9405b49c^`, the revision immediately before the round-7 commit, lines 360-362 are exactly:
+
+```cpp
+    auto metadata = time_series_storage->getInMemoryMetadataPtr(getContext(), false);
+    FailPointInjection::pauseFailPoint(FailPoints::prometheus_remote_write_before_insert);
+    insertBlock(makeBlock(time_series, metrics_metadata, *metadata), *time_series_storage, getContext());
+```
+
+which is the `makeBlock` call the finding describes. At the current head those lines are in the constructor, and the guard the finding asks for - `checkTableAcceptsMetricsMetadata`, refusing a metadata-bearing request up front with a retryable `INCOMPATIBLE_SCHEMA` - sits at line 183 and is called from `write()` before `makeBlock` whenever `metrics_metadata` is non-empty. The regression test the finding asks for is `test_remote_write_metadata_needs_a_wrapper_declaring_its_columns`, which sends non-empty `WriteRequest.metadata` through `/dist/write` and through `/column_granted/write` - the very `prom_column_granted` fixture the finding names - and asserts the metadata reaches the shards in the first case and that the request is refused whole in the second, with a non-vacuous control that the same samples without metadata still travel the narrow wrapper. Both minimum required actions were satisfied by `ebe9405b49c`, which is on the branch. Nothing was changed for this round.
+
+The merge, however, was real work. Master had moved 1589 commits ahead and brought two renames that reach straight into this PR:
+
+- `e45693723dd` renamed the outer column `time_series` to `samples` for `TimeSeries` tables of version 3 and later. The name is now derived per table, `TimeSeriesColumnNames::getOuterSamples(storage->getVersion())`.
+- `e8f39dd6388` renamed the METRICS target to METRIC FAMILIES (version 4), with `timeSeriesMetrics` kept as an alias of `timeSeriesMetricFamilies`. The four outer metadata columns are untouched, so round 7's guard list is still right.
+
+A `Distributed` wrapper has no version to ask. `outerSamplesVersion(storage, metadata)` in `resolvePrometheusQueryTarget.{h,cpp}` returns a `TimeSeries` table's own version and, for anything else, the version implied by the column the wrapper declares. That is the honest answer for a wrapper: it is created `AS <TimeSeries table>` or declares its columns itself, and the name it carries is the only statement it makes. The probe already holds every shard to the wrapper's column, so a shard naming the other one falls into the existing `(no \`samples\` column on ...)` branch - the same verdict the sink would reach later, only up front and with a clear message. No new check was needed.
+
+Two master lines called `time_series_storage->getVersion()` in `PrometheusHTTPProtocolAPI.cpp`, where this PR had widened the member to `ConstStoragePtr`; `IStorage` has no `getVersion()`, so they would not have compiled. Both go through `outerSamplesVersion` now. The five conflicts were in `StoragePrometheusQuery.cpp`, `PrometheusHTTPProtocolAPI.cpp`, `PrometheusRemoteWriteProtocol.cpp`, `TableFunctionTimeSeries.cpp` and the docs; the distributed integration tests and `05055` declare `samples` where they named the outer column, and `05055`'s reference label was updated with its `.sql`.
+
+Merge commit `a7384f4a9a8`.
+
 ## 2. The AST fuzzer failure is not this PR's
 
 What the bot links: `Not-ready Set is passed as the second argument for function 'A (STID: 0250-4e52)` → issue #117806. That link is by normalized message only (the STID replaces every identifier with `A`, so every `Not-ready Set` error shares it). Issue #117806 was an object-storage `_path GLOBAL IN` query, closed as a duplicate fixed by PR #112968 (merged Sep 3, after this branch's last merge of master on Sep 2). The failure on this PR is a different shape:
